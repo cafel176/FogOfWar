@@ -33,10 +33,6 @@
 		{
 			"Name": "MassGameplay",
 			"Enabled": true
-		},
-		{
-			"Name": "OpenRTSCamera",
-			"Enabled": true
 		}
 	]
 }

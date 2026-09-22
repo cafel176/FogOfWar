@@ -10,7 +10,7 @@
 #include "Containers/StringView.h"
 #include "MassRepresentationProcessor.h" // 包含 UMassVisibilityProcessor 的定义
 #include "MassRepresentationFragments.h" // 包含 FMassVisibilityFragment 的定义
-#include "Fragments/PrimaryType.h"
+#include "Fragments/MainType.h"
 
 //----------------------------------------------------------------------//
 // FFogOfWarMassHelpers
