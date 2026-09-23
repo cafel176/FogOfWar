@@ -8,6 +8,7 @@
 #include "MassEntitySubsystem.h"
 #include "Subsystems/MassBattleHashGridSubsystem.h"
 #include "Subsystems/MinimapDataSubsystem.h"
+#include "VarSystem/MassBattleGlobalVarFunctionLibrary.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -189,8 +190,22 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 	int32 VisitedCells = 0;
 	int32 VisitedAgents = 0;
 
+	// 按当前观察队伍过滤视野源：只收集与本地玩家同队的单位视野，避免敌方单位周围也被揭雾。
+	// GetTeam() 在全局变量子系统不可用时返回 INDEX_NONE，此时退化为不按队伍过滤（全场并集），避免整屏变黑。
+	const int32 ViewingTeamIndex = UMassBattleGlobalVarFunctionLibrary::GetTeam(this);
+	const bool bFilterVisionSourcesByTeam = (ViewingTeamIndex != INDEX_NONE);
+	if (!bFilterVisionSourcesByTeam)
+	{
+		static bool bWarnedMissingViewingTeam = false;
+		if (!bWarnedMissingViewingTeam)
+		{
+			bWarnedMissingViewingTeam = true;
+			UE_LOG(LogFogOfWar, Warning, TEXT("Viewing team is unavailable (GetTeam returned INDEX_NONE); scene vision sources will not be filtered by team."));
+		}
+	}
+
 	const double CollectStartTime = FPlatformTime::Seconds();
-	auto UploadCellVisionSources = [this, SafeMaxSources, &EntityManager, &VisitedCells, &VisitedAgents](const FHashGridAgentCell& Cell)
+	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents](const FHashGridAgentCell& Cell)
 	{
 		if (SceneGpuVisionSourceCount >= SafeMaxSources)
 		{
@@ -221,6 +236,16 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 			if (SightRadius <= 0.0f)
 			{
 				continue;
+			}
+
+			// 只保留当前观察队伍的单位视野源（FTeam::index 与 GetTeam() 一致）
+			if (bFilterVisionSourcesByTeam)
+			{
+				const FOW_TEAM_FRAGMENT* TeamFragment = EntityManager.GetFragmentDataPtr<FOW_TEAM_FRAGMENT>(AgentData.EntityHandle);
+				if (!TeamFragment || FOW_GET_TEAM_INDEX(*TeamFragment) != ViewingTeamIndex)
+				{
+					continue;
+				}
 			}
 
 			const FVector WorldLocation = Cell.CellLocation + AgentData.GetRelativeLocation();

@@ -27,6 +27,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "MassBattleSystem",
+			"Enabled": true
+		},
+		{
 			"Name": "Niagara",
 			"Enabled": true
 		},

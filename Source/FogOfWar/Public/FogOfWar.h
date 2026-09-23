@@ -125,7 +125,11 @@ public:
 	 */
 	void Initialize();
 
-	/** 更新场景后处理专用的 Mass 视野源纹理。 */
+	/**
+	 * 更新场景后处理专用的 Mass 视野源纹理。
+	 * @details 只收集与当前观察队伍（UMassBattleGlobalVarFunctionLibrary::GetTeam）同队的单位视野；
+	 *          队伍不可用（INDEX_NONE）时退化为不按队伍过滤。
+	 */
 	void UpdateSceneGpuVisionSourceTexture();
 	//~ End Core Logic Functions
 
