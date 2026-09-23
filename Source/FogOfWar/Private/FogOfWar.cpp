@@ -8,7 +8,7 @@
 #include "MassEntitySubsystem.h"
 #include "Subsystems/MassBattleHashGridSubsystem.h"
 #include "Subsystems/MinimapDataSubsystem.h"
-#include "VarSystem/MassBattleGlobalVarFunctionLibrary.h"
+#include "FogOfWarViewingTeamProvider.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -86,7 +86,8 @@ namespace
 			return false;
 		}
 
-		// ② 队伍过滤：FTeam::index 与 UMassBattleGlobalVarFunctionLibrary::GetTeam 同口径。
+		// ② 队伍过滤：FTeam::index 与“观察队伍提供者”给出的下标同口径
+		//    （FFogOfWarViewingTeamProvider，本工程注册的是 UMassBattleGlobalVarFunctionLibrary::GetTeam）。
 		//    需要过滤或需要回传队伍下标时才读队伍碎片，避免给 GPU 那条热路径增加无谓开销。
 		if (InTeamIndex != INDEX_NONE || OutTeamIndex != nullptr)
 		{
@@ -108,6 +109,8 @@ namespace
 		return true;
 	}
 }
+
+AFogOfWar::AFogOfWar()
 {
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = false;
@@ -247,8 +250,10 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 	int32 VisitedAgents = 0;
 
 	// 按当前观察队伍过滤视野源：只收集与本地玩家同队的单位视野，避免敌方单位周围也被揭雾。
-	// GetTeam() 在全局变量子系统不可用时返回 INDEX_NONE，此时退化为不按队伍过滤（全场并集），避免整屏变黑。
-	const int32 ViewingTeamIndex = UMassBattleGlobalVarFunctionLibrary::GetTeam(this);
+	// 观察队伍来自外部注册的提供者（FFogOfWarViewingTeamProvider，本工程注册的是
+	// UMassBattleGlobalVarFunctionLibrary::GetTeam）；提供者未注册或不可用时返回 INDEX_NONE，
+	// 此时退化为不按队伍过滤（全场并集），避免整屏变黑。
+	const int32 ViewingTeamIndex = FFogOfWarViewingTeamProvider::GetViewingTeam(this);
 	const bool bFilterVisionSourcesByTeam = (ViewingTeamIndex != INDEX_NONE);
 	if (!bFilterVisionSourcesByTeam)
 	{
@@ -256,7 +261,7 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 		if (!bWarnedMissingViewingTeam)
 		{
 			bWarnedMissingViewingTeam = true;
-			UE_LOG(LogFogOfWar, Warning, TEXT("Viewing team is unavailable (GetTeam returned INDEX_NONE); scene vision sources will not be filtered by team."));
+			UE_LOG(LogFogOfWar, Warning, TEXT("Viewing team is unavailable (no viewing team provider registered, or it returned INDEX_NONE); scene vision sources will not be filtered by team."));
 		}
 	}
 

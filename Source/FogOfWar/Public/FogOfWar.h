@@ -146,8 +146,10 @@ public:
 
 	/**
 	 * 更新场景后处理专用的 Mass 视野源纹理。
-	 * @details 只收集与当前观察队伍（UMassBattleGlobalVarFunctionLibrary::GetTeam）同队的单位视野；
-	 *          队伍不可用（INDEX_NONE）时退化为不按队伍过滤。
+	 * @details 只收集与当前观察队伍同队的单位视野。观察队伍由外部注册的提供者给出
+	 *          （FFogOfWarViewingTeamProvider，本工程里注册的是
+	 *          UMassBattleGlobalVarFunctionLibrary::GetTeam）；提供者未注册或返回
+	 *          INDEX_NONE 时退化为不按队伍过滤。
 	 */
 	void UpdateSceneGpuVisionSourceTexture();
 

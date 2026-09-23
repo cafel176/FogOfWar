@@ -51,7 +51,6 @@ public class FogOfWar : ModuleRules
 				"Slate",
 				"SlateCore",
 				"MassCommon",
-				"MassBattleSystem", // UMassBattleGlobalVarFunctionLibrary::GetTeam | 获取当前观察队伍
 				"UMG", // Needed for UUserWidget
 				"Niagara",
 				// ... add private dependencies that you statically link with here ...	
