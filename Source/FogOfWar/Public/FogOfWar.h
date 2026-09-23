@@ -15,14 +15,33 @@
 
 class UTexture2D;
 
+/**
+ * @struct FFogVisionSource
+ * @brief CPU 侧一条视野源：揭雾中心（世界 XY）+ 生效半径（cm）。
+ * @details 与上传给后处理材质的是同一批数据：已按观察队伍过滤，且半径已叠加
+ *          AFogOfWar::SceneGpuVisionSourceRadiusPadding（即实际被揭开的范围）。
+ *          供同工程的 CPU 消费者（如地图的"已探索"层）复用同一条收集链，
+ *          避免各自复刻"谁能看见"的规则而产生分叉。
+ */
+struct FOGOFWAR_API FFogVisionSource
+{
+	/// @brief 揭雾中心的世界 XY 坐标（cm）。
+	FVector2D WorldLocation = FVector2D::ZeroVector;
+
+	/// @brief 生效揭雾半径（cm，已含 SceneGpuVisionSourceRadiusPadding）。
+	float RadiusCm = 0.0f;
+};
+
 /// 声明一个全局的日志分类，用于本模块的日志输出
 DECLARE_LOG_CATEGORY_EXTERN(LogFogOfWar, Log, All)
 
 /**
  * @class AFogOfWar
  * @brief 战争迷雾系统的核心管理器Actor。
- * @details 场景战争迷雾采用 GPU 圆形视野源后处理。CPU 只从 MassBattle HashGrid 收集并压缩
- * 对当前镜头有影响的视野源，然后将 (WorldX, WorldY, SightRadius) 数据上传给一个后处理材质。
+ * @details 场景战争迷雾采用 GPU 圆形视野源后处理。CPU 从 MassBattle HashGrid 收集带
+ * FMassVisionFragment 的 Agent 视野源（全图遍历、按观察队伍过滤、受 MaxSceneGpuVisionSources 上限约束），
+ * 把 (WorldX, WorldY, SightRadius + SceneGpuVisionSourceRadiusPadding) 上传给后处理材质；
+ * 同一批视野源也按队伍暴露给 CPU 侧消费者（CollectVisionSourcesByTeam，供探索层等逻辑累积历史）。
  */
 UCLASS(BlueprintType, Blueprintable)
 class FOGOFWAR_API AFogOfWar : public AActor
@@ -131,6 +150,25 @@ public:
 	 *          队伍不可用（INDEX_NONE）时退化为不按队伍过滤。
 	 */
 	void UpdateSceneGpuVisionSourceTexture();
+
+	/**
+	 * @brief       按队伍收集 CPU 侧视野源（一次遍历分桶）。
+	 * @details     与 UpdateSceneGpuVisionSourceTexture() 走同一套规则（唯一实现见 .cpp 内的
+	 *              TryGetVisionSourceRadius）：FMassVisionFragment::SightRadius 必须为正，
+	 *              生效半径 = SightRadius + SceneGpuVisionSourceRadiusPadding，并按 FTeam::index 归队。
+	 *              与 GPU 侧只有两点不同：① 不按"当前观察队伍"过滤，而是每个队伍各一份；
+	 *              ② 不受 bEnableSceneGpuVisionSources 开关影响（那是渲染开关，而探索累积属于
+	 *              逻辑/观测需求）。每队的收集上限同为 MaxSceneGpuVisionSources。
+	 *              本插件只维护"当前帧可见性"，不保存历史探索状态 —— 需要"累积已探索"的
+	 *              消费者（如地图探索层）应自行累积本接口给出的视野源。
+	 * @param       OutSourcesByTeam        数据类型: TArray<TArray<FFogVisionSource>>&
+	 * @details     输出：索引 = 队伍下标，长度 = InTeamCount（整体覆盖，不做增量追加）。
+	 * @param       InTeamCount             需要分桶的队伍数；<=0 时输出为空。
+	 * @param       OutHighestTeamIndexSeen 可选输出：本次遍历见到过的最大队伍下标（含未落桶的越界队伍），
+	 *                                      供调用方自检"是否有队伍的视野超出了已配置队伍数"。
+	 * @return      收集到的视野源总数（各桶之和；不含越界队伍与无队伍碎片的 Agent）。
+	 */
+	int32 CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& OutSourcesByTeam, int32 InTeamCount, int32* OutHighestTeamIndexSeen = nullptr) const;
 	//~ End Core Logic Functions
 
 public:

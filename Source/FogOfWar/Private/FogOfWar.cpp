@@ -51,7 +51,63 @@ namespace Names
 
 }
 
-AFogOfWar::AFogOfWar()
+namespace
+{
+	/**
+	 * 视野源判定（全插件唯一实现）：该 Agent 是否为指定队伍的视野源，并给出生效揭雾半径。
+	 * GPU 揭雾收集（UpdateSceneGpuVisionSourceTexture）与 CPU 侧逐队收集（CollectVisionSourcesByTeam）
+	 * 都调用这里，保证"谁能看见"的规则只有一份，不会在两条链路之间漂移。
+	 *
+	 * @param InEntityManager   实体管理器。
+	 * @param InAgentData       HashGrid 中的 Agent 数据（实体句柄 + 相对格心偏移）。
+	 * @param InTeamIndex       队伍下标；INDEX_NONE 表示不按队伍过滤（全场并集）。
+	 * @param InRadiusPaddingCm 生效半径余量（AFogOfWar::SceneGpuVisionSourceRadiusPadding）。
+	 * @param OutRadiusCm       输出：生效揭雾半径 = SightRadius + 余量。
+	 * @param OutTeamIndex      可选输出：该 Agent 的队伍下标（无队伍碎片时为 INDEX_NONE）。
+	 * @return 是否为有效视野源。
+	 */
+	bool TryGetVisionSourceRadius(
+		const FMassEntityManager& InEntityManager,
+		const FAgentGridData& InAgentData,
+		int32 InTeamIndex,
+		float InRadiusPaddingCm,
+		float& OutRadiusCm,
+		int32* OutTeamIndex = nullptr)
+	{
+		if (!InEntityManager.IsEntityValid(InAgentData.EntityHandle))
+		{
+			return false;
+		}
+
+		// ① 必须有视野碎片，且视距为正（SightRadius <= 0 视为不揭雾）。
+		const FMassVisionFragment* VisionFragment = InEntityManager.GetFragmentDataPtr<FMassVisionFragment>(InAgentData.EntityHandle);
+		if (!VisionFragment || VisionFragment->SightRadius <= 0.0f)
+		{
+			return false;
+		}
+
+		// ② 队伍过滤：FTeam::index 与 UMassBattleGlobalVarFunctionLibrary::GetTeam 同口径。
+		//    需要过滤或需要回传队伍下标时才读队伍碎片，避免给 GPU 那条热路径增加无谓开销。
+		if (InTeamIndex != INDEX_NONE || OutTeamIndex != nullptr)
+		{
+			const FOW_TEAM_FRAGMENT* TeamFragment = InEntityManager.GetFragmentDataPtr<FOW_TEAM_FRAGMENT>(InAgentData.EntityHandle);
+			const int32 AgentTeamIndex = TeamFragment ? FOW_GET_TEAM_INDEX(*TeamFragment) : INDEX_NONE;
+
+			if (OutTeamIndex)
+			{
+				*OutTeamIndex = AgentTeamIndex;
+			}
+			if (InTeamIndex != INDEX_NONE && AgentTeamIndex != InTeamIndex)
+			{
+				return false;
+			}
+		}
+
+		// ③ 生效半径 = 单体视距 + 场景揭雾余量（与上传给 GPU 的口径一致，避免探索层比画面小一圈）。
+		OutRadiusCm = VisionFragment->SightRadius + InRadiusPaddingCm;
+		return true;
+	}
+}
 {
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = false;
@@ -221,35 +277,21 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 				break;
 			}
 
-			if (!EntityManager.IsEntityValid(AgentData.EntityHandle))
+			// 视野源规则（有效性 + 队伍过滤 + 半径余量）统一收敛在 TryGetVisionSourceRadius 内，
+			// 与 CPU 侧逐队收集共用同一份规则；这里只负责"写进 GPU 缓冲 + 计数"。
+			// 观察队伍不可用（INDEX_NONE）时退化为不按队伍过滤（全场并集），避免整屏变黑。
+			float UploadRadius = 0.0f;
+			if (!TryGetVisionSourceRadius(
+				EntityManager,
+				AgentData,
+				bFilterVisionSourcesByTeam ? ViewingTeamIndex : INDEX_NONE,
+				SceneGpuVisionSourceRadiusPadding,
+				UploadRadius))
 			{
 				continue;
-			}
-
-			const FMassVisionFragment* VisionFrag = EntityManager.GetFragmentDataPtr<FMassVisionFragment>(AgentData.EntityHandle);
-			if (!VisionFrag)
-			{
-				continue;
-			}
-
-			const float SightRadius = VisionFrag->SightRadius;
-			if (SightRadius <= 0.0f)
-			{
-				continue;
-			}
-
-			// 只保留当前观察队伍的单位视野源（FTeam::index 与 GetTeam() 一致）
-			if (bFilterVisionSourcesByTeam)
-			{
-				const FOW_TEAM_FRAGMENT* TeamFragment = EntityManager.GetFragmentDataPtr<FOW_TEAM_FRAGMENT>(AgentData.EntityHandle);
-				if (!TeamFragment || FOW_GET_TEAM_INDEX(*TeamFragment) != ViewingTeamIndex)
-				{
-					continue;
-				}
 			}
 
 			const FVector WorldLocation = Cell.CellLocation + AgentData.GetRelativeLocation();
-			const float UploadRadius = SightRadius + SceneGpuVisionSourceRadiusPadding;
 
 			SceneGpuVisionSourceDataBuffer[SceneGpuVisionSourceCount] = FLinearColor(WorldLocation.X, WorldLocation.Y, UploadRadius, 0.0f);
 			SceneGpuVisionSourceCount++;
@@ -296,6 +338,89 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 		const float TotalMs = static_cast<float>((FPlatformTime::Seconds() - TotalStartTime) * 1000.0);
 		RecordSceneGpuVisionPerfStats(TotalMs, CollectMs, UploadMs, VisitedCells, VisitedAgents);
 	}
+}
+
+int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& OutSourcesByTeam, int32 InTeamCount, int32* OutHighestTeamIndexSeen) const
+{
+	const int32 SafeTeamCount = FMath::Max(0, InTeamCount);
+
+	// 输出整体覆盖：桶数 = 队伍数（不足的队伍就是空桶，调用方据此跳过该队）。
+	OutSourcesByTeam.Reset(SafeTeamCount);
+	OutSourcesByTeam.SetNum(SafeTeamCount);
+	if (OutHighestTeamIndexSeen)
+	{
+		*OutHighestTeamIndexSeen = INDEX_NONE;
+	}
+
+	UWorld* World = GetWorld();
+	UMassEntitySubsystem* EntitySubsystem = World ? World->GetSubsystem<UMassEntitySubsystem>() : nullptr;
+	UMassBattleHashGridSubsystem* HashGrid = World ? World->GetSubsystem<UMassBattleHashGridSubsystem>() : nullptr;
+	if (!EntitySubsystem || !HashGrid || SafeTeamCount <= 0)
+	{
+		return 0;
+	}
+
+	const FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
+	const int32 SafeMaxSources = FMath::Max(1, MaxSceneGpuVisionSources);
+
+	int32 TotalSources = 0;
+	for (const TPair<FIntVector, TSharedPtr<FAgentGridBlock>>& BlockPair : HashGrid->AgentGrid)
+	{
+		if (!BlockPair.Value.IsValid())
+		{
+			continue;
+		}
+
+		const FAgentGridBlock& Block = *BlockPair.Value;
+		for (TConstSetBitIterator<> CellIt(Block.OccupiedCells.OccupiedCellBitArray); CellIt; ++CellIt)
+		{
+			const FHashGridAgentCell& Cell = Block.Cells[CellIt.GetIndex()];
+			for (const FAgentGridData& AgentData : Cell.Agents)
+			{
+				// 先按"不过滤队伍"的规则判定，拿到该 Agent 的队伍下标后再决定落哪个桶：
+				// 越界队伍因此也能被计入 OutHighestTeamIndexSeen（自检用），而不是被静默丢弃。
+				int32 AgentTeamIndex = INDEX_NONE;
+				float RadiusCm = 0.0f;
+				if (!TryGetVisionSourceRadius(
+					EntityManager,
+					AgentData,
+					INDEX_NONE,
+					SceneGpuVisionSourceRadiusPadding,
+					RadiusCm,
+					&AgentTeamIndex))
+				{
+					continue;
+				}
+
+				if (OutHighestTeamIndexSeen && AgentTeamIndex > *OutHighestTeamIndexSeen)
+				{
+					*OutHighestTeamIndexSeen = AgentTeamIndex;
+				}
+
+				// 越界队伍 / 无队伍碎片：不落桶。
+				if (!OutSourcesByTeam.IsValidIndex(AgentTeamIndex))
+				{
+					continue;
+				}
+
+				// 每队各自受 MaxSceneGpuVisionSources 上限约束（与 GPU 侧同一口径）。
+				TArray<FFogVisionSource>& TeamSources = OutSourcesByTeam[AgentTeamIndex];
+				if (TeamSources.Num() >= SafeMaxSources)
+				{
+					continue;
+				}
+
+				const FVector WorldLocation = Cell.CellLocation + AgentData.GetRelativeLocation();
+
+				FFogVisionSource& Out = TeamSources.AddDefaulted_GetRef();
+				Out.WorldLocation = FVector2D(WorldLocation.X, WorldLocation.Y);
+				Out.RadiusCm = RadiusCm;
+				++TotalSources;
+			}
+		}
+	}
+
+	return TotalSources;
 }
 
 void AFogOfWar::RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents)
