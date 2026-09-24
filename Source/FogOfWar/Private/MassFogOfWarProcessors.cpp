@@ -2,6 +2,7 @@
 
 #include "MassFogOfWarProcessors.h"
 #include "FogOfWarMassBinding.h"
+#include "FogOfWarVisionRadius.h"
 #include "MassFogOfWarFragments.h"
 #include "MassCommonFragments.h"
 #include "Subsystems/MinimapDataSubsystem.h"
@@ -314,6 +315,8 @@ void UMassBattleFogOfWarBootstrapProcessor::ConfigureQueries(const TSharedRef<FM
 	EntityQuery.AddRequirement<FOW_TEAM_FRAGMENT>(EMassFragmentAccess::ReadOnly);
 	EntityQuery.AddRequirement<FMassVisionFragment>(EMassFragmentAccess::ReadOnly, EMassFragmentPresence::None);
 	EntityQuery.AddTagRequirement<FAgentTag>(EMassFragmentPresence::All);
+	// 索敌配置 FTrace 不入查询：它有则读、没有则回退默认值，
+	// 由 FogOfWarVision::ResolveSightRadiusCm 内部用 GetFragmentDataPtr 直接取，避免改变本查询的匹配集合。
 	EntityQuery.AddSubsystemRequirement<UMinimapDataSubsystem>(EMassFragmentAccess::ReadOnly);
 	ProcessorRequirements.AddSubsystemRequirement<UMinimapDataSubsystem>(EMassFragmentAccess::ReadOnly);
 }
@@ -326,9 +329,10 @@ void UMassBattleFogOfWarBootstrapProcessor::Execute(FMassEntityManager& EntityMa
 		return;
 	}
 
+	// 回退半径：实体没有索敌配置，或其索敌模式没有与迷雾对应的半径时使用。
 	const float DefaultSightRadius = MinimapSubsystem->DefaultMassBattleSightRadius;
 
-	EntityQuery.ForEachEntityChunk(Context, [DefaultSightRadius](FMassExecutionContext& Context)
+	EntityQuery.ForEachEntityChunk(Context, [&EntityManager, DefaultSightRadius](FMassExecutionContext& Context)
 	{
 		const TArrayView<const FMassEntityHandle> Entities = Context.GetEntities();
 
@@ -341,7 +345,9 @@ void UMassBattleFogOfWarBootstrapProcessor::Execute(FMassEntityManager& EntityMa
 			const FMassEntityHandle Entity = Entities[EntityIndex];
 
 			FMassVisionFragment VisionFragment;
-			VisionFragment.SightRadius = DefaultSightRadius;
+			// 揭雾半径来自实体自身的索敌配置：按 FTrace::Mode 取该模式通用(Common)参数的索敌半径
+			// （无索敌配置/该模式无对应半径时回退 DefaultSightRadius）。
+			VisionFragment.SightRadius = FogOfWarVision::ResolveSightRadiusCm(EntityManager, Entity, DefaultSightRadius);
 			Context.Defer().PushCommand<FMassCommandAddFragmentInstances>(Entity, VisionFragment);
 
 			if (!bHasPreviousVision)

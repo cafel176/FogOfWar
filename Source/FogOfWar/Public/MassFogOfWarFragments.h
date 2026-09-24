@@ -158,6 +158,11 @@ struct FOGOFWAR_API FMassVisionFragment : public FMassFragment
 
 	/// @brief 视野半径（单位：厘米）。
 	/// @details 定义了该实体能够揭示周围区域的最大距离。
+	///          写入者有二，优先级从高到低：
+	///          ① UMassVisionTrait（原型编辑器里显式配置，直接写入本字段）；
+	///          ② UMassBattleFogOfWarBootstrapProcessor（MassBattle Agent 走这条路径：
+	///             按实体自身的索敌配置 FTrace::Mode 解析该模式通用(Common)参数的索敌半径，
+	///             无索敌配置或该模式无对应半径时用 UMinimapDataSubsystem::DefaultMassBattleSightRadius）。
 	UPROPERTY(EditAnywhere, Category = "Fog of War", meta = (ClampMin = 0.0f, UIMin = 0.0f))
 	float SightRadius = 1000.0f;
 };

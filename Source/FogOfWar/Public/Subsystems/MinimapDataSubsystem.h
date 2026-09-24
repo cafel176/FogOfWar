@@ -87,6 +87,11 @@ public:
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "FogOfWar|MassBattle")
 	bool bAutoBindMassBattleAgents = true;
 
+	/**
+	 * 回退揭雾半径（厘米）。Agent 的揭雾半径优先按自身索敌配置解析
+	 * （FTrace::Mode → 该模式通用(Common)参数的索敌半径），仅当实体没有索敌配置、
+	 * 未启用索敌或其索敌模式没有与迷雾对应的半径时才使用本值。
+	 */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "FogOfWar|MassBattle", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float DefaultMassBattleSightRadius = 1024.0f;
 

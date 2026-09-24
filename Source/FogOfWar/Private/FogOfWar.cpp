@@ -254,7 +254,7 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 	// UMassBattleGlobalVarFunctionLibrary::GetTeam）；提供者未注册或不可用时返回 INDEX_NONE，
 	// 此时退化为不按队伍过滤（全场并集），避免整屏变黑。
 	const int32 ViewingTeamIndex = FFogOfWarViewingTeamProvider::GetViewingTeam(this);
-	const bool bFilterVisionSourcesByTeam = (ViewingTeamIndex != INDEX_NONE);
+	const bool bFilterVisionSourcesByTeam = (ViewingTeamIndex != INDEX_NONE && ViewingTeamIndex != 127);
 	if (!bFilterVisionSourcesByTeam)
 	{
 		static bool bWarnedMissingViewingTeam = false;

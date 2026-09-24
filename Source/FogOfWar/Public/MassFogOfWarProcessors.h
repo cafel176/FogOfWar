@@ -70,11 +70,12 @@ private:
 };
 
 /**
- * Automatically attaches FogOfWar fragments to normal MassBattle agents.
+ * 为普通 MassBattle Agent 自动补齐 FogOfWar 所需的 Fragment。
  *
- * MassBattle agent templates are created by MassBattle's own subsystem, so they
- * do not pass through UMassVisionTrait. This processor bridges that gap once per
- * entity, using FogOfWar config defaults when no explicit FogOfWar data exists.
+ * MassBattle 的 Agent 模板由其自身子系统创建，不会经过 UMassVisionTrait，
+ * 因此由本处理器为每个实体补一次：揭雾半径优先按实体自身的索敌配置解析
+ * （FTrace::Mode → 该模式通用(Common)参数的索敌半径，见 FogOfWarVision::ResolveSightRadiusCm），
+ * 无索敌配置或该模式无对应半径时回退到 UMinimapDataSubsystem::DefaultMassBattleSightRadius。
  */
 UCLASS()
 class FOGOFWAR_API UMassBattleFogOfWarBootstrapProcessor : public UMassProcessor
