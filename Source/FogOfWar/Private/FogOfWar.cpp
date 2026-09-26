@@ -5,11 +5,11 @@
 #include "FogOfWarMassBinding.h"
 #include "Camera/CameraTypes.h"
 #include "Camera/PlayerCameraManager.h"
-#include "Components/PostProcessComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
-#include "Engine/Texture2D.h"
 #include "MassEntitySubsystem.h"
+#include "SceneFog/FogOfWarSceneViewExtension.h"
+#include "SceneViewExtension.h"
 #include "Subsystems/MassBattleHashGridSubsystem.h"
 #include "Subsystems/MinimapDataSubsystem.h"
 #include "FogOfWarViewingTeamProvider.h"
@@ -25,40 +25,10 @@ namespace Names
 {
 	const TCHAR* ScenePerformanceCsvRelativePath = TEXT("Logs/FogOfWar_ScenePerf.csv");
 
-	const FName FOW_NotVisibleRegionBrightness("FOW_NotVisibleRegionBrightness");
-	const FName FOW_SceneGpuVisionSourceTexture("FOW_SceneGpuVisionSourceTexture");
-	const FName FOW_SceneGpuVisionSourceCount("FOW_SceneGpuVisionSourceCount");
-	const FName FOW_EnableSceneGpuVisionSources("FOW_EnableSceneGpuVisionSources");
-	const FName FOW_FogEdgeWidth("FOW_FogEdgeWidth");
-
-	// 旧网格路径遗留的 FOW_BottomLeftWorldLocation / FOW_GridSize / FOW_GridWorldSize 已移除：
-	// 当前材质的 Custom 节点只吃「世界 XY + 视野源表 + 开关/计数/亮度/边缘」，这三个参数没有任何
-	// 通往输出的路径。留着它们会让"代码推了什么"与"材质用了什么"继续分叉 —— FOW_FogEdgeWidth
-	// 就是在这种分叉里被漏掉的（材质在用，C++ 从未推送）。
-
-	UTexture2D* CreateSceneGpuVisionDataTexture(UObject* Outer, int32 Width)
-	{
-		if (!Outer || Width <= 0)
-		{
-			return nullptr;
-		}
-
-		UTexture2D* Texture = UTexture2D::CreateTransient(Width, 1, PF_A32B32G32R32F, TEXT("SceneGpuVisionSourceTexture"));
-		if (!Texture)
-		{
-			return nullptr;
-		}
-
-		Texture->CompressionSettings = TextureCompressionSettings::TC_VectorDisplacementmap;
-		Texture->SRGB = 0;
-		Texture->Filter = TF_Nearest;
-		// 这是每帧由 CPU 写入的常驻数据表，绝不能被纹理流送接管：流送会按 mip/LOD 重排底层
-		// 资源，让 UpdateTextureRegions 的原地更新写入错误的资源（引擎也会因此打流送告警）。
-		Texture->NeverStream = true;
-		Texture->UpdateResource();
-		return Texture;
-	}
-
+	// 旧后处理材质路线的全部材质参数名（FOW_*）与那张视野源纹理，已随材质一起删除：
+	// 场景雾现在由 FFogOfWarSceneViewExtension 的两趟 pass 实现（覆盖率遮罩 + 合成），
+	// 参数只有 C++ 属性这一个真值源，不再存在"材质资产里的默认值"与"C++ 每帧推送的值"
+	// 两份可能分叉的契约（FOW_FogEdgeWidth 先前就是这样被漏掉的）。
 }
 
 namespace
@@ -66,12 +36,12 @@ namespace
 	/**
 	 * 圆盘包含判定：InA 的圆盘是否完全落在 InB 的圆盘之内（等价于 dist(A,B) + rA <= rB）。
 	 *
-	 * 为什么删掉被包含的源是严格等价的：材质揭雾取的是所有源的覆盖率最大值，A 若能揭开某个像素，
+	 * 为什么删掉被包含的源是严格等价的：散射遮罩取的是所有源的覆盖率最大值（max 混合），A 若能揭开某个像素，
 	 * 则覆盖该像素的 B 一定能揭开它、且覆盖率不低于 A。所以这是集合等价，不是近似 —— 与视图剔除
 	 * 同一性质（精确优化），而不是"看起来差不多"的启发式裁剪。
 	 *
 	 * 入参约定：x/y 为世界 XY，z 为生效揭雾半径（已含 SceneGpuVisionSourceRadiusPadding），w 未用。
-	 * 注意：等半径的两个源只有在完全同心（含重复上传同一位置）时才会互相判定为包含。
+	 * 注意：等半径的两个源只有在完全同心（含同一位置重复出现的源）时才会互相判定为包含。
 	 */
 	bool IsDiscContainedIn(const FVector4f& InA, const FVector4f& InB)
 	{
@@ -99,7 +69,7 @@ namespace
 
 	/**
 	 * 视野源判定（全插件唯一实现）：该 Agent 是否为指定队伍的视野源，并给出生效揭雾半径。
-	 * GPU 揭雾收集（UpdateSceneGpuVisionSourceTexture）与 CPU 侧逐队收集（CollectVisionSourcesByTeam）
+	 * GPU 揭雾收集（UpdateSceneGpuVisionSources）与 CPU 侧逐队收集（CollectVisionSourcesByTeam）
 	 * 都调用这里，保证"谁能看见"的规则只有一份，不会在两条链路之间漂移。
 	 *
 	 * @param InEntityManager   实体管理器。
@@ -148,7 +118,7 @@ namespace
 			}
 		}
 
-		// ③ 生效半径 = 单体视距 + 场景揭雾余量（与上传给 GPU 的口径一致，避免探索层比画面小一圈）。
+		// ③ 生效半径 = 单体视距 + 场景揭雾余量（与交给 GPU 的口径一致，避免探索层比画面小一圈）。
 		OutRadiusCm = VisionFragment->SightRadius + InRadiusPaddingCm;
 		return true;
 	}
@@ -158,28 +128,6 @@ AFogOfWar::AFogOfWar()
 {
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = false;
-
-	PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProcessComponent"));
-	PostProcess->SetupAttachment(RootComponent);
-}
-
-void AFogOfWar::SetCommonMIDParameters(UMaterialInstanceDynamic* MID)
-{
-	if (!MID)
-	{
-		return;
-	}
-
-	MID->SetScalarParameterValue(Names::FOW_NotVisibleRegionBrightness, NotVisibleRegionBrightness);
-	MID->SetScalarParameterValue(Names::FOW_EnableSceneGpuVisionSources, bEnableSceneGpuVisionSources ? 1.0f : 0.0f);
-	MID->SetScalarParameterValue(Names::FOW_SceneGpuVisionSourceCount, static_cast<float>(SceneGpuVisionSourceCount));
-	// 激活帧也要推一次：否则第一帧会用材质资产自己的默认值，若资产里恰好非 0，就会出现"第一帧雾
-	// 强度与之后不同"的观感跳变。之后每帧还会被 UpdateSceneGpuVisionSourceTexture 再推一次（实时可调）。
-	MID->SetScalarParameterValue(Names::FOW_FogEdgeWidth, FMath::Max(FogEdgeWidth, 0.0f));
-	if (SceneGpuVisionSourceTexture)
-	{
-		MID->SetTextureParameterValue(Names::FOW_SceneGpuVisionSourceTexture, SceneGpuVisionSourceTexture);
-	}
 }
 
 void AFogOfWar::Activate()
@@ -190,8 +138,6 @@ void AFogOfWar::Activate()
 	}
 	bActivated = true;
 
-	checkf(IsValid(PostProcessingMaterial), TEXT("PostProcessingMaterial must be set. GPU FogOfWar uses a single post-process material."));
-
 	Initialize();
 
 	UMinimapDataSubsystem* MinimapSubsystem = UMinimapDataSubsystem::Get();
@@ -200,15 +146,17 @@ void AFogOfWar::Activate()
 		MinimapSubsystem->SetVisionGridActive(false);
 	}
 
-	SceneGpuVisionSourceTexture = Names::CreateSceneGpuVisionDataTexture(this, FMath::Max(1, MaxSceneGpuVisionSources));
-	PostProcessingMID = UMaterialInstanceDynamic::Create(PostProcessingMaterial, this);
-	SetCommonMIDParameters(PostProcessingMID);
-	if (SceneGpuVisionSourceTexture)
+	// 场景雾的 GPU 实现是一个"世界作用域"的 SceneViewExtension：注册之后，该世界所有视图的
+	// Tonemap 之后都会插入 FFogOfWarSceneViewExtension 的两趟 pass（散射遮罩 + 合成）。
+	// 反注册靠成员释放完成（引擎会把当帧引用留到渲染结束），不需要额外的 Deactivate。
+	if (UWorld* World = GetWorld())
 	{
-		PostProcessingMID->SetTextureParameterValue(Names::FOW_SceneGpuVisionSourceTexture, SceneGpuVisionSourceTexture);
+		SceneFogViewExtension = FSceneViewExtensions::NewExtension<FFogOfWarSceneViewExtension>(World);
 	}
-
-	PostProcess->AddOrUpdateBlendable(PostProcessingMID);
+	else
+	{
+		UE_LOG(LogFogOfWar, Warning, TEXT("Activate: 没有有效的 World，场景雾不会渲染（只有 CPU 侧视野源收集仍然可用）。"));
+	}
 
 	PrimaryActorTick.SetTickFunctionEnable(true);
 }
@@ -229,7 +177,7 @@ void AFogOfWar::Tick(float DeltaSeconds)
 
 	Super::Tick(DeltaSeconds);
 
-	UpdateSceneGpuVisionSourceTexture();
+	UpdateSceneGpuVisionSources();
 }
 
 void AFogOfWar::Initialize()
@@ -274,7 +222,7 @@ bool AFogOfWar::BuildVisionSourceCullPlanes(TArray<FPlane>& OutPlanes) const
 		int32 ViewportSizeY = 0;
 		PlayerController->GetViewportSize(ViewportSizeX, ViewportSizeY);
 
-		// 后处理材质跑在视口的实际像素上，因此宽高比优先取视口尺寸，视图自带值只作兜底。
+		// 揭雾最终落在视口的实际像素上，因此宽高比优先取视口尺寸，视图自带值只作兜底。
 		const float Aspect = (ViewportSizeX > 0 && ViewportSizeY > 0)
 			? static_cast<float>(ViewportSizeX) / static_cast<float>(ViewportSizeY)
 			: POV.AspectRatio;
@@ -347,7 +295,7 @@ bool AFogOfWar::IsVisionSourcePossiblyVisible(const TArray<FPlane>& InPlanes, co
 	for (const FPlane& Plane : InPlanes)
 	{
 		// PlaneDot < 0 表示在视锥内侧。圆心到平面的有符号距离小于 -半径，说明整个圆都落在这个
-		// 平面之外，它的并集不可能覆盖任何屏幕像素 —— 对屏幕空间后处理材质零贡献，可安全剔除。
+		// 平面之外，它的并集不可能覆盖任何屏幕像素 —— 对屏幕空间的揭雾遮罩零贡献，可安全剔除。
 		if (Plane.PlaneDot(InCenter) < -InRadiusCm)
 		{
 			return false;
@@ -356,55 +304,36 @@ bool AFogOfWar::IsVisionSourcePossiblyVisible(const TArray<FPlane>& InPlanes, co
 	return true;
 }
 
-void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
+void AFogOfWar::UpdateSceneGpuVisionSources()
 {
 	const double TotalStartTime = FPlatformTime::Seconds();
-	if (!PostProcessingMID)
+
+	if (!SceneFogViewExtension.IsValid())
 	{
 		return;
 	}
 
-	PostProcessingMID->SetScalarParameterValue(Names::FOW_EnableSceneGpuVisionSources, bEnableSceneGpuVisionSources ? 1.0f : 0.0f);
-	// 边缘宽度每帧推（而不是只在激活时推一次），这样它是个能在 PIE 里直接调的视觉旋钮。
-	PostProcessingMID->SetScalarParameterValue(Names::FOW_FogEdgeWidth, FMath::Max(FogEdgeWidth, 0.0f));
-	if (!bEnableSceneGpuVisionSources)
-	{
-		PostProcessingMID->SetScalarParameterValue(Names::FOW_SceneGpuVisionSourceCount, 0.0f);
-		SceneGpuVisionSourceCount = 0;
-		return;
-	}
+	const int32 SafeMaxSources = FMath::Max(1, MaxSceneGpuVisionSources);
 
-	if (!SceneGpuVisionSourceTexture || SceneGpuVisionSourceTexture->GetSizeX() != FMath::Max(1, MaxSceneGpuVisionSources))
-	{
-		SceneGpuVisionSourceTexture = Names::CreateSceneGpuVisionDataTexture(this, FMath::Max(1, MaxSceneGpuVisionSources));
-		if (SceneGpuVisionSourceTexture)
-		{
-			PostProcessingMID->SetTextureParameterValue(Names::FOW_SceneGpuVisionSourceTexture, SceneGpuVisionSourceTexture);
-		}
-	}
-	if (!SceneGpuVisionSourceTexture)
-	{
-		return;
-	}
+	// 本帧的视野源清单：Reset 保留容量，Add 到 Num == 实际条数。交给渲染线程之后，下一帧会换回
+	// 上一帧用过的缓冲，因此稳态下这里不产生任何分配。
+	SceneGpuVisionSources.Reset();
 
-	UWorld* World = GetWorld();
+	int32 VisitedCells = 0;
+	int32 VisitedAgents = 0;
+
+	UWorld* World = bEnableSceneGpuVisionSources ? GetWorld() : nullptr;
 	UMassEntitySubsystem* EntitySubsystem = World ? World->GetSubsystem<UMassEntitySubsystem>() : nullptr;
 	UMassBattleHashGridSubsystem* HashGrid = World ? World->GetSubsystem<UMassBattleHashGridSubsystem>() : nullptr;
 	if (!EntitySubsystem || !HashGrid)
 	{
+		// 收集不到（开关关闭 / 子系统缺失 / 世界正在销毁）时交出一份空表：渲染侧据此完全不注入
+		// pass，雾直接消失，而不是停在上一帧的旧圆盘上。
+		UploadSceneGpuVisionSources();
 		return;
 	}
 
 	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
-
-	const int32 SafeMaxSources = FMath::Max(1, MaxSceneGpuVisionSources);
-
-	// 缓冲只按容量扩一次，不再逐帧整块清零：本帧只写 [0, SceneGpuVisionSourceCount) 这一段，
-	// 尾部既不上传、材质也不会读（材质只按 FOW_SceneGpuVisionSourceCount 循环取 texel）。
-	SceneGpuVisionSourceDataBuffer.SetNum(SafeMaxSources, /*bAllowShrinking=*/false);
-	SceneGpuVisionSourceCount = 0;
-	int32 VisitedCells = 0;
-	int32 VisitedAgents = 0;
 
 	// 按当前观察队伍过滤视野源：只收集与本地玩家同队的单位视野，避免敌方单位周围也被揭雾。
 	// 观察队伍来自外部注册的提供者（FFogOfWarViewingTeamProvider，本工程注册的是
@@ -430,13 +359,13 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 	int32 ContainedSources = 0;
 
 	// 单格内的候选视野源：逐格复用同一块内存，避免每格一次分配。它只服务于"圆盘包含剔除"，
-	// 通过剔除的候选才写进上传缓冲。
+	// 通过剔除的候选才收进本帧清单。
 	TArray<FVector4f> CellSources;
 
 	const double CollectStartTime = FPlatformTime::Seconds();
 	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents, &ViewCullPlanes, bUseViewCulling, &CulledSources, &ContainedSources, &CellSources](const FHashGridAgentCell& Cell)
 	{
-		if (SceneGpuVisionSourceCount >= SafeMaxSources)
+		if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 		{
 			return;
 		}
@@ -447,8 +376,8 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 		{
 			VisitedAgents++;
 
-			// 本格已收下的候选 + 已写进上传缓冲的源，合起来不得超过容量。
-			if (SceneGpuVisionSourceCount + CellSources.Num() >= SafeMaxSources)
+			// 本格已收下的候选 + 已收进清单的源，合起来不得超过容量。
+			if (SceneGpuVisionSources.Num() + CellSources.Num() >= SafeMaxSources)
 			{
 				break;
 			}
@@ -483,7 +412,7 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 
 			// 圆盘包含剔除（判据见 IsDiscContainedIn，集合等价、零画面误差）：
 			// ① 本格已收下的某个候选包含本候选 → 本候选整条丢掉；
-			// ② 本候选包含本格已收下的某个候选 → 把被包含的那条回收（它已无必要上传）。
+			// ② 本候选包含本格已收下的某个候选 → 把被包含的那条回收（它已无必要保留）。
 			// 搜索范围就是同一个 HashGrid 格（250cm 量级），覆盖"单位挤在一起 / 单位贴着自己的建筑"
 			// 这类最常见的重叠；跨格的大圆包小圆不会被这次剔除发现 —— 这不影响正确性（被删掉的源一定
 			// 是冗余的），只影响收益上限。
@@ -511,20 +440,21 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 			CellSources.Add(Candidate);
 		}
 
-		// 通过两道剔除的格内候选，按遍历顺序追加到上传缓冲（顺序无要求，材质取的是 max）。
+		// 通过两道剔除的格内候选按遍历顺序收进清单。顺序无要求：散射时重叠圆盘之间取并集，
+		// 与先后无关。
 		for (const FVector4f& Source : CellSources)
 		{
-			if (SceneGpuVisionSourceCount >= SafeMaxSources)
+			if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 			{
 				break;
 			}
-			SceneGpuVisionSourceDataBuffer[SceneGpuVisionSourceCount++] = Source;
+			SceneGpuVisionSources.Add(Source);
 		}
 	};
 
 	for (const TPair<FIntVector, TSharedPtr<FAgentGridBlock>>& BlockPair : HashGrid->AgentGrid)
 	{
-		if (SceneGpuVisionSourceCount >= SafeMaxSources)
+		if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 		{
 			break;
 		}
@@ -536,7 +466,7 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 		const FAgentGridBlock& Block = *BlockPair.Value;
 		for (TConstSetBitIterator<> CellIt(Block.OccupiedCells.OccupiedCellBitArray); CellIt; ++CellIt)
 		{
-			if (SceneGpuVisionSourceCount >= SafeMaxSources)
+			if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 			{
 				break;
 			}
@@ -546,50 +476,41 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 	}
 	const float CollectMs = static_cast<float>((FPlatformTime::Seconds() - CollectStartTime) * 1000.0);
 
-	const double UploadStartTime = FPlatformTime::Seconds();
-
-	// 只上传本帧实际用到的前 N 条（旧路径无论如何都整块重传 MaxSceneGpuVisionSources 条 = 64KB）。
-	// 纹理宽度仍是 MaxSceneGpuVisionSources，但材质只按 FOW_SceneGpuVisionSourceCount 循环取 texel，
-	// 尾部永远读不到，因此不必上传。
+	// 把清单交给渲染线程：一次加锁交换，游戏线程不碰任何图形资源。
+	//（旧路径每帧在游戏线程重建一张 RHI 纹理并把 64KB 整块传上去，UploadMs 记的是那个代价。）
 	//
-	// 走 UpdateTextureRegions 而不是 UpdateResource：前者是渲染线程上的原地 RHIUpdateTexture2D，
-	// 不会重建 RHI 纹理与 SRV（旧写法每帧重建一次资源，代价与传多少条无关，且会让材质侧的纹理绑定失效）。
-	// 代价是源数据必须活到渲染线程真正执行完，所以这里按 N 拷一份，交给清理回调在 RHI 线程上释放；
-	// N 条通常只有几 KB，远小于旧路径固定的 64KB。
-	if (SceneGpuVisionSourceCount > 0)
-	{
-		const uint32 UploadWidth = static_cast<uint32>(SceneGpuVisionSourceCount);
-		const uint32 UploadBytes = UploadWidth * sizeof(FVector4f);
+	// 注意：UploadSceneGpuVisionSources 会把清单整个交换走（换回来的是上一帧的缓冲），
+	// 因此"本帧源数"必须在交出之前先记下来，否则统计读到的是上一帧的条数。
+	const int32 SourceCount = SceneGpuVisionSources.Num();
 
-		FUpdateTextureRegion2D* UploadRegion = new FUpdateTextureRegion2D(0u, 0u, 0, 0, UploadWidth, 1u);
-		uint8* UploadData = static_cast<uint8*>(FMemory::Malloc(UploadBytes));
-		FMemory::Memcpy(UploadData, SceneGpuVisionSourceDataBuffer.GetData(), UploadBytes);
-
-		SceneGpuVisionSourceTexture->UpdateTextureRegions(
-			0,
-			1,
-			UploadRegion,
-			UploadBytes,        // 只有一行，行距即本行字节数
-			sizeof(FVector4f),  // 每像素字节数
-			UploadData,
-			[](uint8* InSrcData, const FUpdateTextureRegion2D* InRegions)
-			{
-				FMemory::Free(InSrcData);
-				delete InRegions;
-			});
-	}
-
+	const double UploadStartTime = FPlatformTime::Seconds();
+	UploadSceneGpuVisionSources();
 	const float UploadMs = static_cast<float>((FPlatformTime::Seconds() - UploadStartTime) * 1000.0);
-
-	// FOW_SceneGpuVisionSourceTexture 只在纹理创建/重建时设一次即可：对象没变，绑定不会丢，
-	// 旧实现每帧重设一次是多余的。这里只推每帧都在变的计数。
-	PostProcessingMID->SetScalarParameterValue(Names::FOW_SceneGpuVisionSourceCount, static_cast<float>(SceneGpuVisionSourceCount));
 
 	if (bEnableSceneGpuVisionPerformanceStats)
 	{
 		const float TotalMs = static_cast<float>((FPlatformTime::Seconds() - TotalStartTime) * 1000.0);
-		RecordSceneGpuVisionPerfStats(TotalMs, CollectMs, UploadMs, VisitedCells, VisitedAgents, CulledSources, ContainedSources);
+		RecordSceneGpuVisionPerfStats(TotalMs, CollectMs, UploadMs, VisitedCells, VisitedAgents, CulledSources, ContainedSources, SourceCount);
 	}
+}
+
+void AFogOfWar::UploadSceneGpuVisionSources()
+{
+	if (!SceneFogViewExtension.IsValid())
+	{
+		return;
+	}
+
+	// 参数快照与视野源一起交给渲染线程：渲染线程只认这一份，既保证同帧一致，
+	// 也让这些旋钮在 PIE 里改动能立刻生效（不必重启场景）。
+	FFogOfWarSceneFogSettings Settings;
+	Settings.EdgeWidthCm = FMath::Max(FogEdgeWidth, 0.0f);
+	Settings.NotVisibleRegionBrightness = FMath::Clamp(NotVisibleRegionBrightness, 0.0f, 1.0f);
+	Settings.PlaneZ = SceneFogWorldPlaneZ;
+	Settings.MaskResolutionDivisor = FMath::Clamp(SceneGpuVisionMaskResolutionDivisor, 1, 4);
+
+	// 清单本身会被交换走，换回来的是上一帧用过的缓冲（见调用方开头的 Reset）。
+	SceneFogViewExtension->UploadFrameData_GameThread(SceneGpuVisionSources, Settings);
 }
 
 int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& OutSourcesByTeam, int32 InTeamCount, int32* OutHighestTeamIndexSeen) const
@@ -675,12 +596,13 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 	return TotalSources;
 }
 
-void AFogOfWar::RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents, int32 CulledSources, int32 ContainedSources)
+void AFogOfWar::RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents, int32 CulledSources, int32 ContainedSources, int32 SourceCount)
 {
 	SceneGpuVisionPerfTotalMsAccum += TotalMs;
 	SceneGpuVisionPerfCollectMsAccum += CollectMs;
 	SceneGpuVisionPerfUploadMsAccum += UploadMs;
-	SceneGpuVisionPerfSourceCountAccum += SceneGpuVisionSourceCount;
+	// 用调用方在交出清单之前记下的条数：SceneGpuVisionSources 此刻已被交换成上一帧的缓冲。
+	SceneGpuVisionPerfSourceCountAccum += SourceCount;
 	SceneGpuVisionPerfVisitedCellsAccum += VisitedCells;
 	SceneGpuVisionPerfVisitedAgentsAccum += VisitedAgents;
 	SceneGpuVisionPerfCulledSourcesAccum += CulledSources;

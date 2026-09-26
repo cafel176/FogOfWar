@@ -48,6 +48,7 @@ public class FogOfWar : ModuleRules
 				"Projects",
 				"RenderCore",
 				"RHI",
+				"Renderer", // SceneViewExtension 的后处理回调需要 PostProcessMaterialInputs / ScreenPass
 				"Slate",
 				"SlateCore",
 				"MassCommon",

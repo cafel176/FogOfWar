@@ -1,0 +1,138 @@
+// Copyright Winyunq, 2025. All Rights Reserved.
+//
+// 场景战争迷雾（GPU 散射版）：把 N 条视野源（世界 XY + 生效半径）散射成一张屏幕空间覆盖率遮罩，
+// 再做一次全屏合成。入口：
+//   VisionSplatVS / VisionSplatPS —— 每条视野源一个实例化外接多边形，写入覆盖率遮罩（取并集）
+//   CompositeVS   / CompositePS   —— 一个覆盖整个视口的三角形，把遮罩合到场景色上
+//
+// 与旧后处理材质的本质区别在复杂度：
+//   旧：每个屏幕像素 × 每条视野源（两个大数相乘；1080p × 500 源 ≈ 1e9 次内层迭代）
+//   新：Σ每个圆盘覆盖的屏幕面积 + 屏幕像素数（与源数线性，没有乘积项）
+//
+// 世界 → 屏幕的唯一假设：视野圆固定落在世界 Z = FogPlaneZ 平面上（默认 0，即地面基准面）。
+// 像素处的表面高度 h 会带来约 h / tan(俯仰角) 的屏幕偏移，量级远小于
+// SceneGpuVisionSourceRadiusPadding 已经让出的余量，因此"该看见的仍然看得见"。
+//
+// 视野圆之间的并集必须用 max 混合（见 C++ 侧的 TStaticBlendState<..., BO_Max, ...>）：
+// 圆盘外沿是软化段，若用覆盖写，后画的圆会在先画的圆上切出一道缺口。
+
+#include "/Engine/Public/Platform.ush"
+
+// 每个圆盘铺多少条三角形（外接正多边形）。16 条时面积只有圆面积的 1.013 倍：
+// 既把圆盘完整包住（否则多边形会把最外圈软化段切掉，变成硬边），过度绘制也只有 2%。
+#define VISION_SPLAT_TRIANGLES 16
+
+// 每条视野源一个 float4：(WorldX, WorldY, Radius, Reserved)
+StructuredBuffer<float4> VisionSources;
+
+// 世界 → 裁剪空间（FSceneView::ViewMatrices.GetWorldToClip()）
+float4x4 WorldToClip;
+
+// 视野圆所在的世界 Z 平面（cm）
+float FogPlaneZ;
+
+// 视野圆边缘软化宽度（cm）；0 = 硬边
+float SceneFogEdgeWidth;
+
+// 完全被雾覆盖区域的亮度（0 = 全黑，1 = 不压暗）
+float SceneFogNotVisibleRegionBrightness;
+
+// xy = 缩放，zw = 偏移：把 [0,1] 的视口 UV 映射到对应纹理的 UV
+float4 SceneColorUVScaleBias;
+float4 CoverageMaskUVScaleBias;
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+Texture2D CoverageMaskTexture;
+SamplerState CoverageMaskSampler;
+
+struct FVisionSplatVSToPS
+{
+	float4 Position : SV_Position;
+
+	// 该像素射线与 FogPlaneZ 平面的交点世界 XY。
+	// 三角形顶点都落在该平面上，透视校正插值后每个像素拿到的就是它自己的交点，无需再反投影。
+	float2 WorldXY : TEXCOORD0;
+
+	// 本条视野源（同一实例的所有像素相同，用 nointerpolation 省掉一次插值）
+	nointerpolation float2 CircleCenter : TEXCOORD1;
+	nointerpolation float CircleRadius : TEXCOORD2;
+};
+
+FVisionSplatVSToPS VisionSplatVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
+{
+	const float4 Source = VisionSources[InstanceID];
+	const float Radius = max(Source.z, 0.0);
+	const float2 Center = Source.xy;
+
+	// 每个圆盘 VISION_SPLAT_TRIANGLES 条三角形，每条 3 个顶点：
+	// CornerIndex == 0 是圆心，1 / 2 是第 TriangleIndex 与第 TriangleIndex + 1 个圆周点
+	//（最后一条回到 0° 把扇形闭合）。半径放大 1 / cos(π/N) 作外接多边形。
+	const uint TriangleIndex = VertexID / 3u;
+	const uint CornerIndex = VertexID % 3u;
+	const uint RimIndex = TriangleIndex + (CornerIndex == 0u ? 0u : CornerIndex - 1u);
+
+	const float AngleStep = 6.28318530718 / float(VISION_SPLAT_TRIANGLES);
+	const float SplatRadius = Radius / cos(3.14159265359 / float(VISION_SPLAT_TRIANGLES));
+	const float2 RimOffset = float2(cos(float(RimIndex) * AngleStep), sin(float(RimIndex) * AngleStep)) * SplatRadius;
+	const float2 Offset = CornerIndex == 0u ? float2(0.0, 0.0) : RimOffset;
+
+	const float2 WorldXY = Center + Offset;
+
+	FVisionSplatVSToPS Output;
+	Output.Position = mul(float4(WorldXY, FogPlaneZ, 1.0), WorldToClip);
+	Output.WorldXY = WorldXY;
+	Output.CircleCenter = Center;
+	Output.CircleRadius = Radius;
+	return Output;
+}
+
+float VisionSplatPS(FVisionSplatVSToPS Input) : SV_Target0
+{
+	const float Distance = length(Input.WorldXY - Input.CircleCenter);
+	const float Radius = max(Input.CircleRadius, 0.0);
+
+	// 圆内 1、圆外 0，边缘按 SceneFogEdgeWidth 在半径内侧软化。
+	// 软化宽度为 0 时走硬边分支：smoothstep 在 min == max 上是未定义行为，不能靠它退化。
+	float Coverage;
+	if (SceneFogEdgeWidth > 0.0)
+	{
+		Coverage = 1.0 - smoothstep(max(Radius - SceneFogEdgeWidth, 0.0), Radius, Distance);
+	}
+	else
+	{
+		Coverage = Distance < Radius ? 1.0 : 0.0;
+	}
+	return Coverage;
+}
+
+struct FCompositeVSToPS
+{
+	float4 Position : SV_Position;
+	float2 SceneColorUV : TEXCOORD0;
+	float2 CoverageMaskUV : TEXCOORD1;
+};
+
+FCompositeVSToPS CompositeVS(uint VertexID : SV_VertexID)
+{
+	// 一个覆盖整个视口的三角形：(0,0) (2,0) (0,2)。比全屏四边形少一条对角线，
+	// 也没有两个三角形接缝处的重复光栅化。
+	const float2 Corner = float2(float((VertexID << 1u) & 2u), float(VertexID & 2u));
+
+	FCompositeVSToPS Output;
+	Output.Position = float4(Corner.x * 2.0 - 1.0, 1.0 - Corner.y * 2.0, 0.0, 1.0);
+	Output.SceneColorUV = Corner * SceneColorUVScaleBias.xy + SceneColorUVScaleBias.zw;
+	Output.CoverageMaskUV = Corner * CoverageMaskUVScaleBias.xy + CoverageMaskUVScaleBias.zw;
+	return Output;
+}
+
+float4 CompositePS(FCompositeVSToPS Input) : SV_Target0
+{
+	// 采样遮罩用双线性：遮罩可以是半分辨率，双线性顺带把边界软化到亚像素。
+	const float Coverage = saturate(CoverageMaskTexture.SampleLevel(CoverageMaskSampler, Input.CoverageMaskUV, 0).r);
+	const float4 SceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, Input.SceneColorUV, 0);
+
+	// 与旧材质完全相同的合成语义：可见处用原色，不可见处压暗到 FogBrightness 倍。
+	const float Brightness = saturate(SceneFogNotVisibleRegionBrightness);
+	return float4(lerp(SceneColor.rgb * Brightness, SceneColor.rgb, Coverage), SceneColor.a);
+}
