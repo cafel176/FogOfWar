@@ -3,7 +3,11 @@
 #include "FogOfWar.h"
 
 #include "FogOfWarMassBinding.h"
+#include "Camera/CameraTypes.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Components/PostProcessComponent.h"
+#include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
 #include "Engine/Texture2D.h"
 #include "MassEntitySubsystem.h"
 #include "Subsystems/MassBattleHashGridSubsystem.h"
@@ -204,6 +208,114 @@ void AFogOfWar::Initialize()
 	// Minimap now computes its own scale (or uses HashGrid bounds), not FogOfWar's world bounds.
 }
 
+bool AFogOfWar::BuildVisionSourceCullPlanes(TArray<FPlane>& OutPlanes) const
+{
+	OutPlanes.Reset();
+
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		const APlayerController* PlayerController = It->Get();
+		const APlayerCameraManager* CameraManager = PlayerController ? PlayerController->PlayerCameraManager : nullptr;
+		if (!CameraManager)
+		{
+			continue;
+		}
+
+		// 相机缓存里是上一帧实际用于渲染的视图参数（位置、朝向、FOV / 正交宽度、宽高比）。
+		const FMinimalViewInfo& POV = CameraManager->GetCameraCacheView();
+
+		int32 ViewportSizeX = 0;
+		int32 ViewportSizeY = 0;
+		PlayerController->GetViewportSize(ViewportSizeX, ViewportSizeY);
+
+		// 后处理材质跑在视口的实际像素上，因此宽高比优先取视口尺寸，视图自带值只作兜底。
+		const float Aspect = (ViewportSizeX > 0 && ViewportSizeY > 0)
+			? static_cast<float>(ViewportSizeX) / static_cast<float>(ViewportSizeY)
+			: POV.AspectRatio;
+
+		// 相机缓存尚未填过、或该投影模式的关键尺寸为 0 时，整体放弃剔除：用 0 当尺寸算出的视锥
+		// 会退化，把当前可见的源全部剔掉。宁可这一帧不剔除，也绝不误剔。
+		const bool bPOVValid = (Aspect > 0.0f)
+			&& (POV.ProjectionMode == ECameraProjectionMode::Orthographic
+				? POV.OrthoWidth > 0.0f
+				: POV.FOV > 0.0f);
+		if (!bPOVValid)
+		{
+			OutPlanes.Reset();
+			return false;
+		}
+
+		const FRotationMatrix CameraBasis(POV.Rotation);
+		const FVector CameraForward = CameraBasis.GetScaledAxis(EAxis::X);
+		const FVector CameraRight = CameraBasis.GetScaledAxis(EAxis::Y);
+		const FVector CameraUp = CameraBasis.GetScaledAxis(EAxis::Z);
+		const FVector CameraOrigin = POV.Location;
+
+		if (POV.ProjectionMode == ECameraProjectionMode::Orthographic)
+		{
+			// 正交视锥是一个无限延伸的柱体：屏幕覆盖区域与相机距离无关，四个侧平面就够。
+			// RTS 俯视多用正交相机，这条分支必须与透视一样成立。
+			const float HalfWidth = POV.OrthoWidth * 0.5f;
+			const float HalfHeight = HalfWidth / Aspect;
+			const float RightOffset = FVector::DotProduct(CameraRight, CameraOrigin);
+			const float UpOffset = FVector::DotProduct(CameraUp, CameraOrigin);
+
+			OutPlanes.Emplace(CameraRight, RightOffset + HalfWidth);
+			OutPlanes.Emplace(-CameraRight, -RightOffset + HalfWidth);
+			OutPlanes.Emplace(CameraUp, UpOffset + HalfHeight);
+			OutPlanes.Emplace(-CameraUp, -UpOffset + HalfHeight);
+			continue;
+		}
+
+		// 透视视锥：四个侧平面都过相机位置，法线朝视锥内侧，PlaneDot < 0 即在内侧。
+		//
+		// FOV 被解释成哪个轴并不固定：AspectRatioAxisConstraint 为 MaintainXFOV 时它是水平 FOV，
+		// 为 MaintainYFOV（UE 默认）时它是垂直 FOV，而未设置时取引擎全局默认值 —— 在插件里猜错
+		// 就会算出比真实视锥更窄的楔形，把仍然可见的源剔掉。这里不猜：两种解释各算一组半角，
+		// 逐轴取较大者。它在 MaintainYFOV 下恰好等于真实视锥，在 MaintainXFOV 下只会比真实视锥
+		// 更宽，所以无论全局默认是什么都不会误剔（代价最坏是宽屏下多留一点源）。
+		const float TanHalfFOV = FMath::Tan(FMath::DegreesToRadians(POV.FOV * 0.5f));
+		const float HalfFOVX = FMath::Atan(TanHalfFOV * FMath::Max(1.0f, Aspect));
+		const float HalfFOVY = FMath::Atan(TanHalfFOV * FMath::Max(1.0f, 1.0f / Aspect));
+		const float CosX = FMath::Cos(HalfFOVX);
+		const float SinX = FMath::Sin(HalfFOVX);
+		const float CosY = FMath::Cos(HalfFOVY);
+		const float SinY = FMath::Sin(HalfFOVY);
+
+		const FVector LeftNormal = (CameraForward * CosX + CameraRight * SinX).GetSafeNormal();
+		const FVector RightNormal = (CameraForward * CosX - CameraRight * SinX).GetSafeNormal();
+		const FVector TopNormal = (CameraForward * CosY + CameraUp * SinY).GetSafeNormal();
+		const FVector BottomNormal = (CameraForward * CosY - CameraUp * SinY).GetSafeNormal();
+
+		OutPlanes.Emplace(LeftNormal, FVector::DotProduct(LeftNormal, CameraOrigin));
+		OutPlanes.Emplace(RightNormal, FVector::DotProduct(RightNormal, CameraOrigin));
+		OutPlanes.Emplace(TopNormal, FVector::DotProduct(TopNormal, CameraOrigin));
+		OutPlanes.Emplace(BottomNormal, FVector::DotProduct(BottomNormal, CameraOrigin));
+	}
+
+	return OutPlanes.Num() > 0;
+}
+
+bool AFogOfWar::IsVisionSourcePossiblyVisible(const TArray<FPlane>& InPlanes, const FVector& InCenter, float InRadiusCm)
+{
+	for (const FPlane& Plane : InPlanes)
+	{
+		// PlaneDot < 0 表示在视锥内侧。圆心到平面的有符号距离小于 -半径，说明整个圆都落在这个
+		// 平面之外，它的并集不可能覆盖任何屏幕像素 —— 对屏幕空间后处理材质零贡献，可安全剔除。
+		if (Plane.PlaneDot(InCenter) < -InRadiusCm)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 {
 	const double TotalStartTime = FPlatformTime::Seconds();
@@ -265,8 +377,14 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 		}
 	}
 
+	// 视图剔除平面每帧只构建一次，供全部视野源复用。开关关闭或相机不可用时平面为空，
+	// IsVisionSourcePossiblyVisible 恒返回 true，收集循环里不需要再为开关分支。
+	TArray<FPlane> ViewCullPlanes;
+	const bool bUseViewCulling = bCullVisionSourcesOutOfView && BuildVisionSourceCullPlanes(ViewCullPlanes);
+	int32 CulledSources = 0;
+
 	const double CollectStartTime = FPlatformTime::Seconds();
-	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents](const FHashGridAgentCell& Cell)
+	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents, &ViewCullPlanes, bUseViewCulling, &CulledSources](const FHashGridAgentCell& Cell)
 	{
 		if (SceneGpuVisionSourceCount >= SafeMaxSources)
 		{
@@ -297,6 +415,16 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 			}
 
 			const FVector WorldLocation = Cell.CellLocation + AgentData.GetRelativeLocation();
+
+			// 视图剔除。必须排在"上限截断"之前：若先截断，完全落在屏幕外的源会先占满
+			// MaxSceneGpuVisionSources 的名额，把屏幕内的源挤出去，画面直接丢视野。
+			// 半径计入判定，是因为圆心在视锥外、圆本身仍压进屏幕的源依然有贡献。
+			if (bUseViewCulling
+				&& !IsVisionSourcePossiblyVisible(ViewCullPlanes, WorldLocation, UploadRadius + VisionSourceCullExtraMarginCm))
+			{
+				CulledSources++;
+				continue;
+			}
 
 			SceneGpuVisionSourceDataBuffer[SceneGpuVisionSourceCount] = FLinearColor(WorldLocation.X, WorldLocation.Y, UploadRadius, 0.0f);
 			SceneGpuVisionSourceCount++;
@@ -341,7 +469,7 @@ void AFogOfWar::UpdateSceneGpuVisionSourceTexture()
 	if (bEnableSceneGpuVisionPerformanceStats)
 	{
 		const float TotalMs = static_cast<float>((FPlatformTime::Seconds() - TotalStartTime) * 1000.0);
-		RecordSceneGpuVisionPerfStats(TotalMs, CollectMs, UploadMs, VisitedCells, VisitedAgents);
+		RecordSceneGpuVisionPerfStats(TotalMs, CollectMs, UploadMs, VisitedCells, VisitedAgents, CulledSources);
 	}
 }
 
@@ -428,7 +556,7 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 	return TotalSources;
 }
 
-void AFogOfWar::RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents)
+void AFogOfWar::RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents, int32 CulledSources)
 {
 	SceneGpuVisionPerfTotalMsAccum += TotalMs;
 	SceneGpuVisionPerfCollectMsAccum += CollectMs;
@@ -436,6 +564,7 @@ void AFogOfWar::RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, fl
 	SceneGpuVisionPerfSourceCountAccum += SceneGpuVisionSourceCount;
 	SceneGpuVisionPerfVisitedCellsAccum += VisitedCells;
 	SceneGpuVisionPerfVisitedAgentsAccum += VisitedAgents;
+	SceneGpuVisionPerfCulledSourcesAccum += CulledSources;
 	SceneGpuVisionPerfSampleCount++;
 
 	UWorld* World = GetWorld();
@@ -460,14 +589,15 @@ void AFogOfWar::FlushSceneGpuVisionPerfStats(double CurrentTime)
 
 	const float InvSamples = 1.0f / static_cast<float>(SceneGpuVisionPerfSampleCount);
 	const FString CsvColumns = FString::Printf(
-		TEXT("%d,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f"),
+		TEXT("%d,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f"),
 		SceneGpuVisionPerfSampleCount,
 		SceneGpuVisionPerfTotalMsAccum * InvSamples,
 		SceneGpuVisionPerfCollectMsAccum * InvSamples,
 		SceneGpuVisionPerfUploadMsAccum * InvSamples,
 		SceneGpuVisionPerfSourceCountAccum * InvSamples,
 		SceneGpuVisionPerfVisitedCellsAccum * InvSamples,
-		SceneGpuVisionPerfVisitedAgentsAccum * InvSamples);
+		SceneGpuVisionPerfVisitedAgentsAccum * InvSamples,
+		SceneGpuVisionPerfCulledSourcesAccum * InvSamples);
 
 	if (bLogSceneGpuVisionPerformanceToOutputLog)
 	{
@@ -482,6 +612,7 @@ void AFogOfWar::FlushSceneGpuVisionPerfStats(double CurrentTime)
 	SceneGpuVisionPerfSourceCountAccum = 0;
 	SceneGpuVisionPerfVisitedCellsAccum = 0;
 	SceneGpuVisionPerfVisitedAgentsAccum = 0;
+	SceneGpuVisionPerfCulledSourcesAccum = 0;
 	SceneGpuVisionPerfLastFlushTime = CurrentTime;
 }
 
@@ -497,7 +628,7 @@ void AFogOfWar::AppendSceneGpuVisionPerfCsvLine(const FString& CsvColumns) const
 	FString Output;
 	if (bNeedsHeader)
 	{
-		Output += TEXT("WorldTime,Channel,Samples,AvgTotalMs,AvgCollectMs,AvgUploadMs,AvgSourceCount,AvgVisitedCells,AvgVisitedAgents\n");
+		Output += TEXT("WorldTime,Channel,Samples,AvgTotalMs,AvgCollectMs,AvgUploadMs,AvgSourceCount,AvgVisitedCells,AvgVisitedAgents,AvgCulledSources\n");
 	}
 	Output += FString::Printf(TEXT("%.3f,SceneGpuVisionAvg,%s\n"), GetWorld()->GetTimeSeconds(), *CsvColumns);
 	FFileHelper::SaveStringToFile(Output, *FilePath, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), FILEWRITE_Append);

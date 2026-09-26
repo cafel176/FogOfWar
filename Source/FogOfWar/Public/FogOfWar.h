@@ -113,6 +113,25 @@ public:
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float SceneGpuVisionSourceRadiusPadding = 300.0f;
 
+	/// @brief 是否剔除完全落在当前视图之外的视野源。
+	/// @details 后处理材质在屏幕空间逐像素遍历全部视野源，而完全落在视锥之外的圆不可能覆盖任何
+	///          屏幕像素，剔掉它对画面没有任何贡献 —— 这是集合等价，不是近似。
+	///          收益在于：材质内层的循环次数（也就是这套方案几乎全部的 GPU 成本，量级为
+	///          O(屏幕像素数 × 源数)）随后按"可见源占比"线性下降。地图远大于屏幕可视范围时，
+	///          这个占比通常很低，因此这是本方案性价比最高的一处开关。
+	///          判定所需的相机信息不可用时自动整体放弃剔除（宁可多留源，也绝不误剔）。
+	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
+	bool bCullVisionSourcesOutOfView = true;
+
+	/// @brief 视图剔除的额外半径余量（cm）。
+	/// @details 判据本身是几何严格的，但有两个必须让出余量的现实误差：① 相机缓存给的是上一帧
+	///          的视图，而这里遍历的视野源位置是本帧的，两者差一帧 —— 相机高速平移时，上一帧
+	///          视锥之外的源可能已进入本帧画面；② 视图宽高比在极端配置下可能与实际渲染视口
+	///          略有出入。默认 500 cm 相对最小视野半径（1000 cm 起）只在视锥边缘多保留一条很薄
+	///          的带，剔除收益基本不受影响；设为 0 会让这两种误差直接变成画面边缘缺一块揭雾。
+	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "0.0", UIMin = "0.0"))
+	float VisionSourceCullExtraMarginCm = 500.0f;
+
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Performance")
 	bool bEnableSceneGpuVisionPerformanceStats = true;
 
@@ -152,6 +171,21 @@ public:
 	 *          INDEX_NONE 时退化为不按队伍过滤。
 	 */
 	void UpdateSceneGpuVisionSourceTexture();
+
+	/**
+	 * @brief 收集所有本地玩家视图的剔除平面（世界空间；FPlane::PlaneDot 小于 0 视为视锥内侧）。
+	 * @details 每个 View 贡献 4 个侧平面：透视按水平 FOV 与宽高比构造楔形，正交按 OrthoWidth 与
+	 *          宽高比构造柱体。多 View（分屏）时平面取并集 —— 源只要还落在任一 View 内就不剔除。
+	 *          透视/正交都不额外加近远平面：少了那两个平面只会漏剔（保守），不会误剔。
+	 *          任一 View 拿不到可靠的宽高比时，直接整体放弃剔除，因为"用错误的宽高比算出的楔形"
+	 *          比实际视锥更窄，会误剔掉屏幕边缘仍然可见的源。
+	 * @param OutPlanes 输出平面列表；为空表示本次不做剔除。
+	 * @return 是否得到了一组可用的剔除平面。
+	 */
+	bool BuildVisionSourceCullPlanes(TArray<FPlane>& OutPlanes) const;
+
+	/** 视野圆（中心 + 半径）是否可能落在任一视图之内。平面为空时恒为 true（不剔除）。 */
+	static bool IsVisionSourcePossiblyVisible(const TArray<FPlane>& InPlanes, const FVector& InCenter, float InRadiusCm);
 
 	/**
 	 * @brief       按队伍收集 CPU 侧视野源（一次遍历分桶）。
@@ -207,7 +241,11 @@ public:
 	int32 SceneGpuVisionPerfVisitedCellsAccum = 0;
 	int32 SceneGpuVisionPerfVisitedAgentsAccum = 0;
 
-	void RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents);
+	/// @brief 统计周期内被视图剔除的视野源数累计。与 AvgSourceCount 对照即可读出剔除收益
+	///        （材质内循环次数正比于实际上传的源数，而不是遍历到的源数）。
+	int32 SceneGpuVisionPerfCulledSourcesAccum = 0;
+
+	void RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents, int32 CulledSources);
 	void FlushSceneGpuVisionPerfStats(double CurrentTime);
 	void AppendSceneGpuVisionPerfCsvLine(const FString& CsvColumns) const;
 
