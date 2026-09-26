@@ -113,6 +113,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float SceneGpuVisionSourceRadiusPadding = 300.0f;
 
+	/// @brief 视野圆边缘的软化宽度（cm）。0 = 硬边（材质走 step 分支）。
+	/// @details 每帧随其它参数推给材质的 FOW_FogEdgeWidth，因此可以在 PIE 里实时调。
+	///          ⚠ 材质里的软化分支目前写的是 `1.5 - smoothstep(...)`：smoothstep 值域是 [0,1]，
+	///          于是圆外基线变成 0.5（saturate 之后），会把整屏迷雾的强度削掉约一半。要让
+	///          > 0 的软化宽度正确生效，必须先把材质 Custom 节点里的 `1.5 -` 改成 `1.0 -`；
+	///          在材质改好之前请保持 0（硬边），否则会把原本的雾强度改动一起带进去。
+	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "0.0", UIMin = "0.0", Units = "cm"))
+	float FogEdgeWidth = 0.0f;
+
 	/// @brief 是否剔除完全落在当前视图之外的视野源。
 	/// @details 后处理材质在屏幕空间逐像素遍历全部视野源，而完全落在视锥之外的圆不可能覆盖任何
 	///          屏幕像素，剔掉它对画面没有任何贡献 —— 这是集合等价，不是近似。
@@ -226,8 +235,9 @@ public:
 	UPROPERTY(VisibleInstanceOnly, Category = "FogOfWar|Textures")
 	TObjectPtr<UTexture2D> SceneGpuVisionSourceTexture = nullptr;
 
-	/// @brief 避免每帧重复分配的场景视野源上传缓冲。
-	TArray<FLinearColor> SceneGpuVisionSourceDataBuffer;
+	/// @brief 避免每帧重复分配的场景视野源上传缓冲，元素即材质读到的 texel：(WorldX, WorldY, Radius, Reserved)。
+	/// @details 只有前 SceneGpuVisionSourceCount 条是本帧有效的：每帧只把这一段上传给纹理。
+	TArray<FVector4f> SceneGpuVisionSourceDataBuffer;
 
 	/// @brief 当前已写入 SceneGpuVisionSourceTexture 的视野源数量。
 	int32 SceneGpuVisionSourceCount = 0;
@@ -245,7 +255,12 @@ public:
 	///        （材质内循环次数正比于实际上传的源数，而不是遍历到的源数）。
 	int32 SceneGpuVisionPerfCulledSourcesAccum = 0;
 
-	void RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents, int32 CulledSources);
+	/// @brief 统计周期内被圆盘包含剔除的视野源数累计。判据是"圆盘完全落在另一个圆盘内"，
+	///        属于集合等价删除（删掉它对画面严格无影响），与视图剔除同一性质；
+	///        搜索范围限于同一个 HashGrid 格内，因此是"可靠的但未必穷尽"的剔除。
+	int32 SceneGpuVisionPerfContainedSourcesAccum = 0;
+
+	void RecordSceneGpuVisionPerfStats(float TotalMs, float CollectMs, float UploadMs, int32 VisitedCells, int32 VisitedAgents, int32 CulledSources, int32 ContainedSources);
 	void FlushSceneGpuVisionPerfStats(double CurrentTime);
 	void AppendSceneGpuVisionPerfCsvLine(const FString& CsvColumns) const;
 
