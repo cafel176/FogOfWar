@@ -12,7 +12,7 @@
 /// @file FogOfWar.h
 /// @brief 定义了战争迷雾系统的核心Actor AFogOfWar。
 
-/** 场景雾的渲染实现（定义在 Private/SceneFog 下）：散射覆盖率遮罩 + 合成。 */
+/** 场景雾的渲染实现（定义在 Private/SceneFog 下）：世界空间视野场散射 + R8G8 打包 + 合成。 */
 class FFogOfWarSceneViewExtension;
 
 /**
@@ -40,10 +40,13 @@ DECLARE_LOG_CATEGORY_EXTERN(LogFogOfWar, Log, All)
  * @brief 战争迷雾系统的核心管理器Actor。
  * @details 场景战争迷雾的 GPU 路径：CPU 从 MassBattle HashGrid 收集带 FMassVisionFragment 的
  * Agent 视野源（全图遍历、按观察队伍过滤、视图剔除 + 圆盘包含剔除，受 MaxSceneGpuVisionSources
- * 上限约束），把 (WorldX, WorldY, SightRadius + SceneGpuVisionSourceRadiusPadding) 交给
- * FFogOfWarSceneViewExtension，由它在 Tonemap 之后散射成屏幕空间覆盖率遮罩再合成。
- * 这是把成本从 O(屏幕像素数 × 源数) 降到 O(Σ 圆盘屏幕面积 + 屏幕像素数) 的关键（详见该类的说明）。
+ * 上限约束），把 (WorldX, WorldY, SightRadius + SceneGpuVisionSourceRadiusPadding) 连同视野场几何
+ * 交给 FFogOfWarSceneViewExtension，由它在 Tonemap 之后散射成世界空间视野场再合成（详见该类的说明）。
  * 同一批视野源也按队伍暴露给 CPU 侧消费者（CollectVisionSourcesByTeam，供探索层等逻辑累积历史）。
+ *
+ * @details “历史已探索”不由本类持有：本插件只维护当前帧可见性，历史由外部权威系统累积
+ *          （本工程里是 UMassBattleMapSubsystem 的逐队探索层），经 FFogOfWarExploredLayerProvider
+ *          把位图借给渲染侧当灰雾通道用。没有提供者时画面退化为“可见 / 不可见”二态。
  */
 UCLASS(BlueprintType, Blueprintable)
 class FOGOFWAR_API AFogOfWar : public AActor
@@ -77,15 +80,31 @@ public:
 	bool bAutoActivate = true;
 
 	/// @brief 世界网格范围（以世界坐标中心点 + 尺寸定义）。
-	/// @details 当前无“边界盒”语义：这是坐标归一化参数，不做几何裁剪。
-	/// @note 场景雾是相机视角内的散射实现，不使用任何网格空间参数；这个属性保留给依赖世界范围
-	///       做坐标归一化的外部逻辑。
+	/// @note 视野场需要一块覆盖地图范围的规则网格，而地图范围的首选来源是外部探索层
+	///       （FFogOfWarExploredLayerProvider 给出的矩形，它同时决定已探索层的对齐）。只有拿不到
+	///       提供者时才退回本属性 —— 那时场分辨率会按 VisionFieldTexelSizeCm 与每轴上限自适应，
+	///       因此这里给一个偏大的缺省值是安全的，不会把场撑爆。
+	/// @details 本属性同时是坐标归一化参数（供依赖世界范围的外部逻辑使用），本身不做几何裁剪。
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "FogOfWar|Bounds", meta = (ClampMin = "1.0", UIMin = "1.0"))
 	FVector2D WorldGridSize = FVector2D(409600.0f, 409600.0f);
 
-	/// @brief 非可见区域（完全被迷雾覆盖）的亮度：0 = 全黑，1 = 不压暗。
+	/// @brief 从未探索区域（完全被迷雾覆盖）的亮度：0 = 全黑，1 = 不压暗。
 	UPROPERTY(EditAnywhere, meta = (ClampMin = 0.0f, UIMin = 0.0f, ClampMax = 1.0f, UIMax = 1.0f))
 	float NotVisibleRegionBrightness = 0.1f;
+
+	/// @brief 已探索、但当前不可见区域的亮度 —— 经典的“灰雾”。
+	/// @details 这一档来自外部权威探索层（FFogOfWarExploredLayerProvider）；没有提供者时它不是一条
+	///          无效配置，而是“永远不会被采样到”的旋钮，画面退化为“可见 / 不可见”二态。
+	///          低于 NotVisibleRegionBrightness 时会被自动抬到该值：记忆不该比完全没去过还黑。
+	UPROPERTY(EditAnywhere, meta = (ClampMin = 0.0f, UIMin = 0.0f, ClampMax = 1.0f, UIMax = 1.0f))
+	float ExploredRegionBrightness = 0.35f;
+
+	/// @brief 战争迷雾遮蔽区域的不透明度：0 = 完全透明（看不出有雾），1 = 完全不透明（按上面的亮度压暗）。
+	/// @details 与两个 Brightness 是正交的两件事：亮度决定“被遮住的地方压多暗”，本参数决定“这层遮蔽有多浓”。
+	///          调低它会让未探索与已探索两档同时变淡，两者的相对明暗关系保持不变；当前可见的像素
+	///          本来就不被遮蔽，因此不受本参数影响。
+	UPROPERTY(EditAnywhere, meta = (ClampMin = 0.0f, UIMin = 0.0f, ClampMax = 1.0f, UIMax = 1.0f))
+	float SceneFogOpacity = 0.5f;
 
 	/// @brief 场景雾的 GPU 揭雾源总开关。关闭时本帧交出空清单，渲染侧连 pass 都不注入（雾消失）。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
@@ -116,18 +135,22 @@ public:
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (Units = "cm"))
 	float SceneFogWorldPlaneZ = 0.0f;
 
-	/// @brief 覆盖率遮罩的分辨率分母：1 = 与视口同分辨率，2 = 半分辨率（散射光栅化面积降到 1/4）。
-	/// @details 半分辨率时靠合成阶段的双线性采样把边界软化到亚像素，代价是遮罩边界有约 1 像素的
-	///          位置量化。默认 1，即与视口同分辨率。
-	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "1", ClampMax = "4", UIMin = "1", UIMax = "4"))
-	int32 SceneGpuVisionMaskResolutionDivisor = 1;
+	/// @brief 视野场的纹素世界边长（cm）：场分辨率 ≈ 地图尺寸 / 这个值。
+	/// @details 场是“当前覆盖率 + 历史已探索”的载体，它的分辨率与视口分辨率无关 —— 这是覆盖率改算在
+	///          世界空间之后才成立的性质。地图范围异常大时分辨率会按上限等比放大（纹素边长随之变大），
+	///          因此这里的值只是一个期望值，调小会让散射的纹素量按平方增长，调大会让雾边变块状。
+	///          默认 64cm：一个 4000cm 的视野半径约 62 个纹素，软化边缘足够平滑。
+	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "1.0", UIMin = "1.0", Units = "cm"))
+	float VisionFieldTexelSizeCm = 64.0f;
 
 	/// @brief 是否剔除完全落在当前视图之外的视野源。
-	/// @details 完全落在视锥之外的圆不可能覆盖任何屏幕像素，剔掉它对画面没有任何贡献 ——
-	///          这是集合等价，不是近似。
-	///          新实现的成本与源数线性相关（每条源一个实例化多边形），因此这个开关的作用从
-	///          "性能生死线"变成"减少无谓的实例与源上传"；地图远大于屏幕可视范围时依然值得开着。
+	/// @details 合成阶段只会采样屏幕像素对应的世界点，而它们全部落在视锥内，所以完全落在视锥之外的圆
+	///          不可能影响任何一个输出像素 —— 这是集合等价，不是近似。
+	///          散射成本与源数线性相关（每条源一个 compute 线程组），因此这个开关的作用从
+	///          "性能生死线"变成"减少无谓的线程组与源上传"；地图远大于屏幕可视范围时依然值得开着。
 	///          判定所需的相机信息不可用时自动整体放弃剔除（宁可多留源，也绝不误剔）。
+	/// @note 剔除只影响“当前这一帧画什么”，不影响历史已探索层 —— 后者由外部系统用不剔除的
+	///       CollectVisionSourcesByTeam 累积，因此屏幕被移出视野的单位仍然会被记进探索层。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
 	bool bCullVisionSourcesOutOfView = true;
 
@@ -168,8 +191,10 @@ public:
 	/**
 	 * @brief       初始化战争迷雾系统。
 	 * @details     在激活时调用，按 WorldGridSize 算出以 Actor 为中心的世界网格范围，
-	 *              供依赖"世界范围"做坐标归一化的外部逻辑使用。
-	 *              渲染资源（覆盖率遮罩、视野源缓冲）全部由渲染线程按帧创建，这里不涉及。
+	 *              供依赖“世界范围”做坐标归一化的外部逻辑使用；它同时是视野场几何在拿不到外部
+	 *              地图范围（FFogOfWarExploredLayerProvider）时的兜底 —— 那份范围更准，因为它
+	 *              必须与逐格已探索层同矩形。
+	 *              渲染资源（视野场、覆盖率场、探索层缓冲）全部由渲染线程按帧创建，这里不涉及。
 	 */
 	void Initialize();
 
@@ -238,11 +263,20 @@ public:
 	///          下一帧换回上一帧的缓冲继续复用，因此稳态下不产生分配。
 	TArray<FVector4f> SceneGpuVisionSources;
 
+	/// @brief 最近一次采用的已探索层版本号（由提供者给出）。
+	/// @details 只有它变化时才重新取位图并交给渲染线程：探索层每秒只变几次，而这里是每帧一次。
+	///          INDEX_NONE 表示“当前没有可用的已探索层”（无提供者 / 网格未就绪 / 观察队伍不可用），
+	///          此时渲染侧收到的是一份空层，画面退化为“可见 / 不可见”二态。
+	int32 SceneFogExploredLayerSourceVersion = INDEX_NONE;
+
 	/**
-	 * @brief 把当前视野源清单与参数快照交给渲染线程（未注册扩展时什么都不做）。
+	 * @brief 把当前视野源清单、参数快照与视野场几何交给渲染线程，并顺带刷新已探索层（未注册扩展时什么都不做）。
 	 * @details 参数与源同帧一起过去，渲染线程只认这一份快照：既保证同帧一致，也让这些旋钮
-	 *          （FogEdgeWidth / NotVisibleRegionBrightness / 投影平面 / 遮罩分辨率）在 PIE 里
-	 *          改动能立刻生效。
+	 *          （FogEdgeWidth / 两个亮度 / 投影平面 / 场纹素边长）在 PIE 里改动能立刻生效。
+	 *
+	 * @details 场几何优先取外部探索层给的地图范围（它与逐格探索层必须同矩形，否则灰雾会整体错位），
+	 *          拿不到时才退回本 Actor 的 GridBottomLeftWorldLocation + GridSize。已探索层同样在这里
+	 *          刷新：它每秒只变几次，靠提供者给出的版本号判断要不要重新取。
 	 */
 	void UploadSceneGpuVisionSources();
 

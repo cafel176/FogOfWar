@@ -4,8 +4,11 @@
 
 #include "CommonRenderResources.h"
 #include "DynamicRHI.h"
+#include "FogOfWar.h"
 #include "GlobalShader.h"
+#include "Math/IntVector.h"
 #include "PipelineStateCache.h"
+#include "PixelShaderUtils.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -18,15 +21,14 @@
 namespace
 {
 	/**
-	 * 圆盘铺成外接正多边形的三角形条数，必须与 FogOfWarScene.usf 里的 VISION_SPLAT_TRIANGLES 一致。
-	 * 16 条时多边形面积是圆面积的 1.013 倍：完整包住圆盘（内接多边形会把最外圈软化段切掉），
-	 * 过度绘制只有 2%。
+	 * 场内覆盖率的定标分母：场纹理用整数做原子取最大，落回浮点时除以它。
+	 * 8 位与最终 PF_R8G8 的通道精度一致，再高的定标只会在打包时被丢掉。
 	 */
-	constexpr uint32 VisionSplatTriangleCount = 16;
+	constexpr float VisionCoverageScale = 255.0f;
 
 	/**
-	 * 两趟 pass 共用的固定管线状态。
-	 * 顶点位置全部由 SV_VertexID / SV_InstanceID 程序化生成，因此不需要顶点缓冲（空顶点声明）。
+	 * 合成趟共用的固定管线状态。
+	 * 顶点位置全部由 SV_VertexID 程序化生成，因此不需要顶点缓冲（空顶点声明）。
 	 */
 	void ConfigureFogOfWarPipeline(
 		FRHICommandList& RHICmdList,
@@ -37,81 +39,59 @@ namespace
 		RHICmdList.ApplyCachedRenderTargets(OutPipelineState);
 		OutPipelineState.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
 		OutPipelineState.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
-		// 默认是覆盖写。散射那趟会换成 max 混合（重叠圆盘取并集），合成那趟保持覆盖写。
 		OutPipelineState.BlendState = TStaticBlendState<>::GetRHI();
 		OutPipelineState.PrimitiveType = PT_TriangleList;
 		OutPipelineState.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
 		OutPipelineState.BoundShaderState.VertexShaderRHI = VertexShader;
 		OutPipelineState.BoundShaderState.PixelShaderRHI = PixelShader;
 	}
+
 }
 
 // ---------------------------------------------------------------------------------------------
 // 着色器声明
+//
+// 趟 1（散射）与趟 2（打包）各自只有一个阶段，参数结构可以就地定义；趟 3（合成）有顶点/像素
+// 两个阶段，必须把"pass 参数（RDG 依赖 + 渲染目标）"与"各阶段最小参数"分开 —— 共用一份会让
+// 某个字段只被一个阶段声明，而着色器编译器是按"入口点用到的名字"去根参数结构里找的。
+//
+// @note 顶点/像素阶段的结构里保存的是同一批 RDG 资源对象的指针副本，而 RDG 是按"pass 参数结构里
+//       出现过哪些资源"来决定要创建哪些 view、并在 pass 执行前就地把这些资源对象转成 RHI 的。
+//       所以着色器要绑定的 RDG 资源必须在这份 pass 结构里再列一次 —— 这不是冗余：少了它，
+//       那条 SRV/UAV 就永远不会被建出来。
 // ---------------------------------------------------------------------------------------------
 
 /**
- * 散射 pass 的 pass 参数：只承担 RDG 的资源依赖与渲染目标绑定，不参与着色器绑定
- * （与合成趟同构：顶点/像素阶段各自用最小的参数结构，避免跨阶段字段不匹配）。
- *
- * @note 顶点/像素阶段各自的结构里保存的是同一批 RDG 资源对象的指针副本，而 RDG 是按
- *       "pass 参数结构里出现过哪些资源"来决定要创建哪些 view、并在 pass 执行前就地把这些
- *       资源对象转成 RHI 的（FRDGBuilder::ConvertToExternalTexture / InitViewRHI 改的是资源
- *       对象本身，不是结构里的字段）。所以着色器要绑定的 RDG 资源必须在这份结构里再列一次 ——
- *       这里列 VisionSources 不是冗余：少了它，那条 StructuredBuffer SRV 就永远不会被建出来。
+ * 散射 compute：每条视野源只在自己的场 AABB 内派发线程，把定标覆盖率用 InterlockedMax 写进整数场。
+ * 这是"彻底消掉重叠 overdraw"的落点 —— 重叠区只剩整数原子比较，不再有逐层像素着色与混合。
  */
-BEGIN_SHADER_PARAMETER_STRUCT(FFogOfWarSceneSplatPassParameters, )
-	/** 覆盖率遮罩（本趟输出）。 */
-	RENDER_TARGET_BINDING_SLOTS()
-
-	/** 每帧的视野源表：(WorldX, WorldY, Radius, Reserved)。 */
-	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VisionSources)
-END_SHADER_PARAMETER_STRUCT()
-
-/**
- * 散射顶点着色器：每条视野源一个实例，程序化生成一个外接正多边形并投影到屏幕。
- * 世界 → 裁剪用 FSceneView::ViewMatrices.GetWorldToClip()，因此不假设相机是正交、也不假设地图朝向。
- */
-class FFogOfWarSceneSplatVS : public FGlobalShader
+class FFogOfWarSceneVisionFieldSplatCS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FFogOfWarSceneSplatVS);
-	SHADER_USE_PARAMETER_STRUCT(FFogOfWarSceneSplatVS, FGlobalShader);
+	DECLARE_GLOBAL_SHADER(FFogOfWarSceneVisionFieldSplatCS);
+	SHADER_USE_PARAMETER_STRUCT(FFogOfWarSceneVisionFieldSplatCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		/** 每帧的视野源表：(WorldX, WorldY, Radius, Reserved)。 */
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VisionSources)
 
-		/** 世界 → 裁剪空间。 */
-		SHADER_PARAMETER(FMatrix44f, WorldToClip)
+		/** 每条源的场 AABB：xy = 最小纹素（含），zw = 最大纹素（不含）。 */
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, VisionSourceAabbs)
 
-		/** 视野圆所在的世界 Z 平面（cm）。 */
-		SHADER_PARAMETER(float, FogPlaneZ)
-	END_SHADER_PARAMETER_STRUCT()
+		/** 覆盖率场（定标 0..255 的整数）。 */
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, VisionCoverage)
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
-	}
-};
+		/** 场纹素 (0,0) 左上角的世界 XY。 */
+		SHADER_PARAMETER(FVector2f, FieldWorldMin)
 
-/**
- * 散射像素着色器：覆盖率 = 1 - smoothstep(Radius - EdgeWidth, Radius, Distance)，圆内 1、圆外 0。
- * 旧材质里写成 1.5 - smoothstep(...) 的笔误（圆外基线被抬到 0.5、整屏雾被削掉约一半）随材质一起消失。
- *
- * @note 每个入口点引用到的全局变量都必须出现在它自己这个类的 FParameters 里：着色器编译器会按
- *       "入口点用到的名字"去根参数结构里找，找不到就编译失败（SceneFogEdgeWidth 只被像素阶段读，
- *       因此它属于这里，而不是顶点阶段的结构）。
- */
-class FFogOfWarSceneSplatPS : public FGlobalShader
-{
-public:
-	DECLARE_GLOBAL_SHADER(FFogOfWarSceneSplatPS);
-	SHADER_USE_PARAMETER_STRUCT(FFogOfWarSceneSplatPS, FGlobalShader);
+		/** 单个场纹素的世界边长（cm）。 */
+		SHADER_PARAMETER(float, FieldTexelSizeCm)
 
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		/** 视野圆边缘软化宽度（cm）；0 = 硬边。 */
 		SHADER_PARAMETER(float, SceneFogEdgeWidth)
+
+		/** 覆盖率定标分母（255）。 */
+		SHADER_PARAMETER(float, VisionCoverageScale)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -121,13 +101,43 @@ public:
 };
 
 /**
- * 合成 pass 的 pass 参数：只承担 RDG 的资源依赖与渲染目标绑定，不参与着色器绑定。
- * 这样顶点/像素两个阶段可以各自用最小的参数结构，不必强行共用一份（共用会引入
- * "某个字段只被一个阶段声明"的跨阶段绑定问题）。
- *
- * @note 这里列出的两张输入纹理同样不是冗余：像素阶段的结构里只是它们的指针副本，
- *       资源对象本身要靠在 pass 参数里出现才会被 RDG 分配并转成 RHI（理由见散射趟同名注释）。
+ * 打包像素着色器：R = 当前覆盖率，G = 已探索。全屏顶点由 FPixelShaderUtils 提供（不需要自备 VS），
+ * 而那个入口要求参数结构自己带上渲染目标绑定 —— 因此这里把 RENDER_TARGET_BINDING_SLOTS 直接放进
+ * PS 的 FParameters，不再另拆一份 pass 参数：本趟只有像素一个阶段，没有"某个字段只被一个阶段声明"
+ * 的问题（那才是合成趟必须拆参数的原因）。
  */
+class FFogOfWarSceneVisionFieldPackPS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FFogOfWarSceneVisionFieldPackPS);
+	SHADER_USE_PARAMETER_STRUCT(FFogOfWarSceneVisionFieldPackPS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		/** 视野场（本趟输出，PF_R8G8）。 */
+		RENDER_TARGET_BINDING_SLOTS()
+
+		/** 趟 1 的整数覆盖率。 */
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, VisionCoverageTexture)
+
+		/** 历史已探索层（LSB-first 位流）。 */
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VisionExploredBits)
+
+		/** 已探索位图的分辨率（格数）；场与它共用同一个世界矩形，UV 直接换算。 */
+		SHADER_PARAMETER(FIntPoint, VisionExploredExtent)
+
+		/** 场分辨率（纹素数）。 */
+		SHADER_PARAMETER(FIntPoint, FieldTexelCount)
+
+		SHADER_PARAMETER(float, VisionCoverageScale)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+/** 合成 pass 的 pass 参数：只承担 RDG 的资源依赖与渲染目标绑定，不参与着色器绑定。 */
 BEGIN_SHADER_PARAMETER_STRUCT(FFogOfWarSceneCompositePassParameters, )
 	/** 合成输出。 */
 	RENDER_TARGET_BINDING_SLOTS()
@@ -135,11 +145,18 @@ BEGIN_SHADER_PARAMETER_STRUCT(FFogOfWarSceneCompositePassParameters, )
 	/** 输入场景色（Tonemap 之后的 LDR 颜色）。 */
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
 
-	/** 视野覆盖率遮罩。 */
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CoverageMaskTexture)
+	/** 覆盖率 + 已探索打包成的 R8G8。 */
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VisionFieldTexture)
 END_SHADER_PARAMETER_STRUCT()
 
-/** 合成顶点着色器：一个覆盖整个视口的三角形，同时把 [0,1] 的视口 UV 变换到两张输入纹理各自的 UV。 */
+/**
+ * 合成顶点着色器：一个覆盖整个视口的三角形，输出视口 UV 与换算好的场景色 UV。
+ *
+ * @note 反投影（视口 UV → 世界 XY）刻意不在这里做。顶点输出 Position.w = 1，光栅器据此判定
+ *       “无透视”并对所有附加量做屏幕空间线性插值，而世界平面上的 XY 是屏幕坐标的有理函数
+ *       （含透视除法）：只有三角形三个角上正确，中间会被拉偏，偏移量还随俯仰角变化 ——
+ *       症状就是雾随相机转动而相对场景滑移。视口 UV 与屏幕像素是线性关系，才是能安全插值的量。
+ */
 class FFogOfWarSceneCompositeVS : public FGlobalShader
 {
 public:
@@ -147,9 +164,8 @@ public:
 	SHADER_USE_PARAMETER_STRUCT(FFogOfWarSceneCompositeVS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		/** xy = 缩放，zw = 偏移：把视口 UV 映射到纹理 UV。 */
+		/** xy = 缩放，zw = 偏移：把视口 UV 映射到场景色纹理的 UV。 */
 		SHADER_PARAMETER(FVector4f, SceneColorUVScaleBias)
-		SHADER_PARAMETER(FVector4f, CoverageMaskUVScaleBias)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -159,7 +175,11 @@ public:
 };
 
 /**
- * 合成像素着色器：可见处用原色，不可见处压暗到 FogBrightness 倍 —— 与旧材质完全相同的合成语义。
+ * 合成像素着色器：逐像素反投影到世界平面，采样 R8G8，三态合成 ——
+ * 从未探索 / 已探索但当前不可见 / 当前可见。
+ *
+ * @note 同一个字段（如 InvViewProjection）在顶点与像素两个阶段都要用时，必须出现在真正引用它的
+ *       那个阶段的 FParameters 里。这里 WS/PS 各只有一处引用，因此各放一份，不做共用结构。
  */
 class FFogOfWarSceneCompositePS : public FGlobalShader
 {
@@ -168,11 +188,27 @@ public:
 	SHADER_USE_PARAMETER_STRUCT(FFogOfWarSceneCompositePS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		/** 裁剪空间 → 世界（FViewMatrices::GetClipToWorld()）。 */
+		SHADER_PARAMETER(FMatrix44f, InvViewProjection)
+
+		/** 视野场所在的世界 Z 平面（cm）。 */
+		SHADER_PARAMETER(float, FogPlaneZ)
+
+		/** 场的世界最小角（XY，cm）。 */
+		SHADER_PARAMETER(FVector2f, FieldWorldMin)
+
+		/** 场的世界尺寸（XY，cm）。 */
+		SHADER_PARAMETER(FVector2f, FieldWorldExtent)
+
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CoverageMaskTexture)
-		SHADER_PARAMETER_SAMPLER(SamplerState, CoverageMaskSampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VisionFieldTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, VisionFieldSampler)
 		SHADER_PARAMETER(float, SceneFogNotVisibleRegionBrightness)
+		SHADER_PARAMETER(float, SceneFogExploredRegionBrightness)
+
+		/** 雾层自身的不透明度：0 = 完全透出场景色，1 = 完全不透明（按上面的亮度压暗）。 */
+		SHADER_PARAMETER(float, SceneFogOpacity)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -181,8 +217,8 @@ public:
 	}
 };
 
-IMPLEMENT_GLOBAL_SHADER(FFogOfWarSceneSplatVS, "/Plugin/FogOfWar/Private/FogOfWarScene.usf", "VisionSplatVS", SF_Vertex);
-IMPLEMENT_GLOBAL_SHADER(FFogOfWarSceneSplatPS, "/Plugin/FogOfWar/Private/FogOfWarScene.usf", "VisionSplatPS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FFogOfWarSceneVisionFieldSplatCS, "/Plugin/FogOfWar/Private/FogOfWarScene.usf", "VisionFieldSplatCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FFogOfWarSceneVisionFieldPackPS, "/Plugin/FogOfWar/Private/FogOfWarScene.usf", "VisionFieldPackPS", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FFogOfWarSceneCompositeVS, "/Plugin/FogOfWar/Private/FogOfWarScene.usf", "CompositeVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FFogOfWarSceneCompositePS, "/Plugin/FogOfWar/Private/FogOfWarScene.usf", "CompositePS", SF_Pixel);
 
@@ -195,7 +231,10 @@ FFogOfWarSceneViewExtension::FFogOfWarSceneViewExtension(const FAutoRegister& Au
 {
 }
 
-void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(TArray<FVector4f>& InOutSources, const FFogOfWarSceneFogSettings& InSettings)
+void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
+	TArray<FVector4f>& InOutSources,
+	const FFogOfWarSceneFogSettings& InSettings,
+	const FFogOfWarSceneVisionField& InField)
 {
 	check(IsInGameThread());
 
@@ -205,6 +244,15 @@ void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(TArray<FVector4f>& 
 	//（调用方拿回数组后 Reset + Add 复用它的容量即可）。
 	Swap(PendingSources, InOutSources);
 	PendingSettings = InSettings;
+	PendingField = InField;
+}
+
+void FFogOfWarSceneViewExtension::UploadExploredLayer_GameThread(const FFogOfWarSceneExploredLayer& InExploredLayer)
+{
+	check(IsInGameThread());
+
+	FScopeLock Lock(&PendingLock);
+	PendingExploredLayer = InExploredLayer;
 }
 
 void FFogOfWarSceneViewExtension::SubscribeToPostProcessingPass(
@@ -227,10 +275,18 @@ void FFogOfWarSceneViewExtension::SubscribeToPostProcessingPass(
 		FScopeLock Lock(&PendingLock);
 		RenderThreadSources = PendingSources;
 		RenderThreadSettings = PendingSettings;
+		RenderThreadField = PendingField;
+
+		// 已探索层只在内容真的变化时拷贝：它是逐格位图，比视野源大两三个数量级，
+		// 而探索层每秒只变几次。同一帧的第二个视口因为版本号已经对齐，同样会跳过。
+		if (PendingExploredLayer.Version != RenderThreadExploredLayer.Version)
+		{
+			RenderThreadExploredLayer = PendingExploredLayer;
+		}
 	}
 
-	// 没有视野源（未激活 / 本帧无采集 / 上限配成 0）就干脆不注入回调：连一次全屏 pass 都不产生。
-	if (RenderThreadSources.Num() == 0)
+	// 没有视野源、或场几何还没就绪（地图范围未知）就干脆不注入回调：连一次全屏 pass 都不产生。
+	if (RenderThreadSources.Num() == 0 || !RenderThreadField.IsValid())
 	{
 		return;
 	}
@@ -245,8 +301,8 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 {
 	check(IsInRenderingThread());
 
-	// 兜底：理论上 SubscribeToPostProcessingPass 已经过滤过空表。
-	if (RenderThreadSources.Num() == 0)
+	// 兜底：理论上 SubscribeToPostProcessingPass 已经过滤过这两种情况。
+	if (RenderThreadSources.Num() == 0 || !RenderThreadField.IsValid())
 	{
 		return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
 	}
@@ -278,80 +334,160 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 			View.GetOverwriteLoadAction());
 	}
 
-	const FIntPoint ViewSize = Output.ViewRect.Size();
-	const int32 MaskResolutionDivisor = FMath::Clamp(RenderThreadSettings.MaskResolutionDivisor, 1, 4);
-
-	// 遮罩按"视口矩形"建立，而不是按整张输出纹理：这样无论 ViewRect 落在纹理的什么位置
-	//（分屏、编辑器视口），NDC → 遮罩像素的映射都等价于 NDC → ViewRect，且与分辨率分母无关。
-	const FIntPoint MaskExtent(
-		FMath::Max(1, FMath::DivideAndRoundUp(ViewSize.X, MaskResolutionDivisor)),
-		FMath::Max(1, FMath::DivideAndRoundUp(ViewSize.Y, MaskResolutionDivisor)));
+	const FFogOfWarSceneVisionField& Field = RenderThreadField;
+	const FIntPoint FieldExtent = Field.TexelCount;
+	const FVector2f FieldWorldMin(static_cast<float>(Field.WorldMin.X), static_cast<float>(Field.WorldMin.Y));
+	const FVector2f FieldWorldExtent(static_cast<float>(Field.WorldSize.X), static_cast<float>(Field.WorldSize.Y));
 
 	const FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
-	TShaderMapRef<FFogOfWarSceneSplatVS> SplatVertexShader(ShaderMap);
-	TShaderMapRef<FFogOfWarSceneSplatPS> SplatPixelShader(ShaderMap);
+	TShaderMapRef<FFogOfWarSceneVisionFieldSplatCS> SplatShader(ShaderMap);
+	TShaderMapRef<FFogOfWarSceneVisionFieldPackPS> PackPixelShader(ShaderMap);
 	TShaderMapRef<FFogOfWarSceneCompositeVS> CompositeVertexShader(ShaderMap);
 	TShaderMapRef<FFogOfWarSceneCompositePS> CompositePixelShader(ShaderMap);
 
-	// ---- 趟 1：散射。每条视野源一个实例化外接多边形，写入覆盖率遮罩 ----
-	// 源数据每帧上传一次。QueueBufferUpload 内部会自己拷贝，因此这里的源数组不要求活到执行期。
+	const int32 SourceCount = RenderThreadSources.Num();
+
+	// ---- 数据上传：视野源 + 每条源的场 AABB（纯算术，不含任何相机投影）----
 	FRDGBufferRef VisionSourceBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), RenderThreadSources.Num()),
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), SourceCount),
 		TEXT("FogOfWar.VisionSources"));
 	GraphBuilder.QueueBufferUpload(
 		VisionSourceBuffer,
 		RenderThreadSources.GetData(),
-		RenderThreadSources.Num() * sizeof(FVector4f),
+		SourceCount * sizeof(FVector4f),
 		ERDGInitialDataFlags::None);
 
-	// 单通道 8 位：软化边缘只有 0..1 的精度需求，8 位足够，带宽与占用最小。
-	FRDGTextureRef CoverageMaskTexture = GraphBuilder.CreateTexture(
-		FRDGTextureDesc::Create2D(MaskExtent, PF_R8, FClearValueBinding::Black, TexCreate_RenderTargetable | TexCreate_ShaderResource),
-		TEXT("FogOfWar.CoverageMask"));
+	// AABB 是"圆心 ± 半径"换算出的纹素矩形，并在两轴分别 clamp 到场范围。
+	// 完全落在场外的源得到空矩形（min == max），散射 compute 里对应的循环体自然不执行。
+	TArray<FIntVector4> SourceAabbs;
+	SourceAabbs.SetNumUninitialized(SourceCount);
+	{
+		const float InvTexelSizeCm = 1.0f / Field.TexelSizeCm;
+		const float WorldMinX = static_cast<float>(Field.WorldMin.X);
+		const float WorldMinY = static_cast<float>(Field.WorldMin.Y);
 
-	auto* SplatPassParameters = GraphBuilder.AllocParameters<FFogOfWarSceneSplatPassParameters>();
-	SplatPassParameters->RenderTargets[0] = FRenderTargetBinding(CoverageMaskTexture, ERenderTargetLoadAction::EClear);
-	SplatPassParameters->VisionSources = GraphBuilder.CreateSRV(VisionSourceBuffer);
-
-	FFogOfWarSceneSplatVS::FParameters SplatVSParameters;
-	SplatVSParameters.VisionSources = SplatPassParameters->VisionSources;
-	SplatVSParameters.WorldToClip = FMatrix44f(View.ViewMatrices.GetWorldToClip());
-	SplatVSParameters.FogPlaneZ = RenderThreadSettings.PlaneZ;
-
-	FFogOfWarSceneSplatPS::FParameters SplatPSParameters;
-	SplatPSParameters.SceneFogEdgeWidth = FMath::Max(RenderThreadSettings.EdgeWidthCm, 0.0f);
-
-	const uint32 SourceCount = static_cast<uint32>(RenderThreadSources.Num());
-
-	GraphBuilder.AddPass(
-		RDG_EVENT_NAME("FogOfWar.VisionSplat(%u)", SourceCount),
-		SplatPassParameters,
-		ERDGPassFlags::Raster,
-		[SplatPassParameters, SplatVSParameters, SplatPSParameters, SplatVertexShader, SplatPixelShader, SourceCount, MaskExtent](FRDGAsyncTask, FRHICommandList& RHICmdList)
+		for (int32 Index = 0; Index < SourceCount; ++Index)
 		{
-			RHICmdList.SetViewport(0.0f, 0.0f, 0.0f, static_cast<float>(MaskExtent.X), static_cast<float>(MaskExtent.Y), 1.0f);
+			const FVector4f& Source = RenderThreadSources[Index];
+			const float Radius = FMath::Max(Source.Z, 0.0f);
 
-			FGraphicsPipelineStateInitializer GraphicsPSOInit;
-			ConfigureFogOfWarPipeline(RHICmdList, GraphicsPSOInit, SplatVertexShader.GetVertexShader(), SplatPixelShader.GetPixelShader());
-			// 重叠圆盘必须取并集：圆盘外沿是软化段，若用覆盖写，后画的圆会在先画的圆上切出一道缺口。
-			GraphicsPSOInit.BlendState = TStaticBlendState<CW_RED, BO_Max, BF_One, BF_One, BO_Max, BF_One, BF_One>::GetRHI();
-			SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+			const int32 MinX = FMath::Clamp(FMath::FloorToInt((Source.X - Radius - WorldMinX) * InvTexelSizeCm), 0, FieldExtent.X);
+			const int32 MinY = FMath::Clamp(FMath::FloorToInt((Source.Y - Radius - WorldMinY) * InvTexelSizeCm), 0, FieldExtent.Y);
+			const int32 MaxX = FMath::Clamp(FMath::CeilToInt((Source.X + Radius - WorldMinX) * InvTexelSizeCm), 0, FieldExtent.X);
+			const int32 MaxY = FMath::Clamp(FMath::CeilToInt((Source.Y + Radius - WorldMinY) * InvTexelSizeCm), 0, FieldExtent.Y);
 
-			SetShaderParameters(RHICmdList, SplatVertexShader, SplatVertexShader.GetVertexShader(), SplatVSParameters);
-			SetShaderParameters(RHICmdList, SplatPixelShader, SplatPixelShader.GetPixelShader(), SplatPSParameters);
+			SourceAabbs[Index] = FIntVector4(MinX, MinY, MaxX, MaxY);
+		}
+	}
 
-			// 顶点完全程序化生成，不需要流源。NumPrimitives = 每条实例的三角形数，NumInstances = 源数。
-			RHICmdList.SetStreamSource(0, nullptr, 0);
-			RHICmdList.DrawPrimitive(0, VisionSplatTriangleCount, SourceCount);
-		});
+	FRDGBufferRef AabbBuffer = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(FIntVector4), SourceCount),
+		TEXT("FogOfWar.VisionSourceAabbs"));
+	GraphBuilder.QueueBufferUpload(
+		AabbBuffer,
+		SourceAabbs.GetData(),
+		SourceCount * sizeof(FIntVector4),
+		ERDGInitialDataFlags::None);
 
-	// ---- 趟 2：合成。一个覆盖整个视口的三角形，把遮罩合到场景色上 ----
+	// ---- 趟 1：散射。每条视野源一个线程组，只扫自己的 AABB，整数原子取最大 ----
+	// R32_UINT：这是唯一能做 InterlockedMax 的场格式；8 位定标与最终 R8G8 的通道精度对齐。
+	FRDGTextureRef CoverageTexture = GraphBuilder.CreateTexture(
+		FRDGTextureDesc::Create2D(
+			FieldExtent, PF_R32_UINT, FClearValueBinding::Black,
+			TexCreate_ShaderResource | TexCreate_UAV),
+		TEXT("FogOfWar.VisionCoverage"));
+
+	FRDGTextureUAVRef CoverageUAV = GraphBuilder.CreateUAV(CoverageTexture);
+	// 原子累加的起点必须是 0（未覆盖）。CreateTexture 的内容是未定义的，不能省这一步。
+	AddClearUAVPass(GraphBuilder, CoverageUAV, 0u);
+
+	auto* SplatParameters = GraphBuilder.AllocParameters<FFogOfWarSceneVisionFieldSplatCS::FParameters>();
+	SplatParameters->VisionSources = GraphBuilder.CreateSRV(VisionSourceBuffer);
+	SplatParameters->VisionSourceAabbs = GraphBuilder.CreateSRV(AabbBuffer);
+	SplatParameters->VisionCoverage = CoverageUAV;
+	SplatParameters->FieldWorldMin = FieldWorldMin;
+	SplatParameters->FieldTexelSizeCm = Field.TexelSizeCm;
+	SplatParameters->SceneFogEdgeWidth = FMath::Max(RenderThreadSettings.EdgeWidthCm, 0.0f);
+	SplatParameters->VisionCoverageScale = VisionCoverageScale;
+
+	// GroupCount 的 Z 维就是源数：一个线程组 = 一条视野源。组内 8×8 的线程按步长扫过该源的 AABB，
+	// 因此派发出来的线程全部落在"这条源真正可能覆盖的纹素"上，没有全屏 × 全源的乘积项。
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("FogOfWar.VisionFieldSplat(%d)", SourceCount),
+		SplatShader,
+		SplatParameters,
+		FIntVector(1, 1, SourceCount));
+
+	// ---- 历史已探索层：保持位打包，只有几 KB ----
+	// 位序与 FRlSpatialMap::ExploredBitmap 一致，所以从不展开；没有提供者时给一个 0 元素的兜底，
+	// 让着色器里的 G 通道恒为 0（画面退化成阶段一的二态雾）。
+	FIntPoint ExploredExtent(1, 1);
+	FRDGBufferRef ExploredBitsBuffer = nullptr;
+	if (RenderThreadExploredLayer.IsValid())
+	{
+		ExploredExtent = RenderThreadExploredLayer.Extent;
+		ExploredBitsBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), RenderThreadExploredLayer.PackedBits.Num()),
+			TEXT("FogOfWar.ExploredBits"));
+		GraphBuilder.QueueBufferUpload(
+			ExploredBitsBuffer,
+			RenderThreadExploredLayer.PackedBits.GetData(),
+			RenderThreadExploredLayer.PackedBits.Num() * sizeof(uint32),
+			ERDGInitialDataFlags::None);
+	}
+	else
+	{
+		static const uint32 EmptyExploredBits = 0u;
+		ExploredBitsBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1),
+			TEXT("FogOfWar.ExploredBitsEmpty"));
+		GraphBuilder.QueueBufferUpload(
+			ExploredBitsBuffer,
+			&EmptyExploredBits,
+			sizeof(uint32),
+			ERDGInitialDataFlags::None);
+	}
+
+	FRDGBufferSRVRef ExploredBitsSRV = GraphBuilder.CreateSRV(ExploredBitsBuffer);
+
+	// ---- 趟 2：打包。整数覆盖率 + 已探索 → PF_R8G8（R = 当前覆盖率，G = 已探索）----
+	// 两通道放进同一张纹理，合成趟一次采样就能同时拿到"现在能不能看见"与"以前有没有看见过"。
+	FRDGTextureRef VisionFieldTexture = GraphBuilder.CreateTexture(
+		FRDGTextureDesc::Create2D(
+			FieldExtent, PF_R8G8, FClearValueBinding::Black,
+			TexCreate_RenderTargetable | TexCreate_ShaderResource),
+		TEXT("FogOfWar.VisionField"));
+
+	auto* PackParameters = GraphBuilder.AllocParameters<FFogOfWarSceneVisionFieldPackPS::FParameters>();
+	// 整张场都会被写满，因此不需要保留上一帧内容。
+	PackParameters->RenderTargets[0] = FRenderTargetBinding(VisionFieldTexture, ERenderTargetLoadAction::ENoAction);
+	PackParameters->VisionCoverageTexture = CoverageTexture;
+	PackParameters->VisionExploredBits = ExploredBitsSRV;
+	PackParameters->VisionExploredExtent = ExploredExtent;
+	PackParameters->FieldTexelCount = FieldExtent;
+	PackParameters->VisionCoverageScale = VisionCoverageScale;
+
+	// 全屏顶点由 FPixelShaderUtils 自带的 VS 提供：打包趟只关心像素，不必自备一个空的顶点阶段。
+	FPixelShaderUtils::AddFullscreenPass(
+		GraphBuilder,
+		ShaderMap,
+		RDG_EVENT_NAME("FogOfWar.VisionFieldPack"),
+		PackPixelShader,
+		PackParameters,
+		FIntRect(0, 0, FieldExtent.X, FieldExtent.Y));
+
+	// ---- 趟 3：合成 ----
 	const FIntPoint SceneColorExtent = SceneColor.Texture->Desc.Extent;
 
 	auto* CompositePassParameters = GraphBuilder.AllocParameters<FFogOfWarSceneCompositePassParameters>();
 	CompositePassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
 	CompositePassParameters->SceneColorTexture = SceneColor.Texture;
-	CompositePassParameters->CoverageMaskTexture = CoverageMaskTexture;
+	CompositePassParameters->VisionFieldTexture = VisionFieldTexture;
+
+	// 反投影矩阵只在像素阶段用（顶点阶段交给光栅器插值的必须是屏幕空间线性量），因此它属于
+	// CompositePS 的参数结构；VS 那边只剩一个 UV 换算，这是"每个入口点各自的参数结构"的直接结果。
+	const FMatrix44f ClipToWorld = FMatrix44f(View.ViewMatrices.GetClipToWorld());
 
 	FFogOfWarSceneCompositeVS::FParameters CompositeVSParameters;
 	CompositeVSParameters.SceneColorUVScaleBias = FVector4f(
@@ -359,19 +495,23 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 		static_cast<float>(SceneColor.ViewRect.Height()) / static_cast<float>(SceneColorExtent.Y),
 		static_cast<float>(SceneColor.ViewRect.Min.X) / static_cast<float>(SceneColorExtent.X),
 		static_cast<float>(SceneColor.ViewRect.Min.Y) / static_cast<float>(SceneColorExtent.Y));
-	// 遮罩正好覆盖视口矩形，这里只需按"向上取整后的遮罩尺寸"做一次亚像素校正。
-	CompositeVSParameters.CoverageMaskUVScaleBias = FVector4f(
-		static_cast<float>(ViewSize.X) / static_cast<float>(MaskExtent.X * MaskResolutionDivisor),
-		static_cast<float>(ViewSize.Y) / static_cast<float>(MaskExtent.Y * MaskResolutionDivisor),
-		0.0f,
-		0.0f);
 
 	FFogOfWarSceneCompositePS::FParameters CompositePSParameters;
+	CompositePSParameters.InvViewProjection = ClipToWorld;
+	CompositePSParameters.FogPlaneZ = RenderThreadSettings.PlaneZ;
+	CompositePSParameters.FieldWorldMin = FieldWorldMin;
+	CompositePSParameters.FieldWorldExtent = FieldWorldExtent;
 	CompositePSParameters.SceneColorTexture = SceneColor.Texture;
 	CompositePSParameters.SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-	CompositePSParameters.CoverageMaskTexture = CoverageMaskTexture;
-	CompositePSParameters.CoverageMaskSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-	CompositePSParameters.SceneFogNotVisibleRegionBrightness = RenderThreadSettings.NotVisibleRegionBrightness;
+	CompositePSParameters.VisionFieldTexture = VisionFieldTexture;
+	CompositePSParameters.VisionFieldSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	CompositePSParameters.SceneFogNotVisibleRegionBrightness = FMath::Clamp(RenderThreadSettings.NotVisibleRegionBrightness, 0.0f, 1.0f);
+	// 已探索区必须不比未探索区更暗，否则"记忆"反而把画面压得更黑 —— 夹一次比拼参数的人自觉更可靠。
+	CompositePSParameters.SceneFogExploredRegionBrightness = FMath::Clamp(
+		RenderThreadSettings.ExploredRegionBrightness,
+		CompositePSParameters.SceneFogNotVisibleRegionBrightness,
+		1.0f);
+	CompositePSParameters.SceneFogOpacity = FMath::Clamp(RenderThreadSettings.Opacity, 0.0f, 1.0f);
 
 	const FIntRect OutputRect = Output.ViewRect;
 

@@ -1,116 +1,244 @@
 // Copyright Winyunq, 2025. All Rights Reserved.
 //
-// 场景战争迷雾（GPU 散射版）：把 N 条视野源（世界 XY + 生效半径）散射成一张屏幕空间覆盖率遮罩，
-// 再做一次全屏合成。入口：
-//   VisionSplatVS / VisionSplatPS —— 每条视野源一个实例化外接多边形，写入覆盖率遮罩（取并集）
-//   CompositeVS   / CompositePS   —— 一个覆盖整个视口的三角形，把遮罩合到场景色上
+// 场景战争迷雾（世界空间视野场版）。三趟：
+//   VisionFieldSplatCS   —— 每条视野源只在自己的场 AABB 内派发线程，用 InterlockedMax 把定标覆盖率
+//                           写进 R32_UINT。重叠圆盘因此不再各跑一遍像素着色、也不再有混合状态：
+//                           overdraw 被彻底消掉（旧实现的成本是 Σ 圆盘屏幕面积 × 重叠层数）。
+//   VisionFieldPackVS/PS —— 把整数覆盖率与"历史已探索"打包成一张 PF_R8G8：
+//                           R = 当前帧视野覆盖率，G = 已探索（一旦置位不回退）。
+//   CompositeVS/PS       —— 屏幕像素反投影到世界平面 → 采样 R8G8 → 可见 / 已探索但不可见 / 未探索三态。
 //
-// 与旧后处理材质的本质区别在复杂度：
-//   旧：每个屏幕像素 × 每条视野源（两个大数相乘；1080p × 500 源 ≈ 1e9 次内层迭代）
-//   新：Σ每个圆盘覆盖的屏幕面积 + 屏幕像素数（与源数线性，没有乘积项）
+// 覆盖率为什么算在世界空间而不是屏幕空间：
+//   ① 每条源的 AABB 是纯算术（世界圆 → 场纹素矩形），不含任何相机投影，因此不存在"源落在相机后方 /
+//      掠射角导致屏幕 AABB 退化"这类必须在 CPU 端特判的边界情形；
+//   ② 结果与相机无关：多视口（分屏 / SceneCapture）共享同一份场，splat 一帧只做一次；
+//   ③ 与"历史已探索"所在的逐格网格同世界矩形、同 UV，G 通道不需要任何额外换算。
 //
-// 世界 → 屏幕的唯一假设：视野圆固定落在世界 Z = FogPlaneZ 平面上（默认 0，即地面基准面）。
-// 像素处的表面高度 h 会带来约 h / tan(俯仰角) 的屏幕偏移，量级远小于
-// SceneGpuVisionSourceRadiusPadding 已经让出的余量，因此"该看见的仍然看得见"。
+// 复杂度：
+//   旧（后处理材质）：O(屏幕像素数 × 源数) —— 1080p × 500 源 ≈ 1e9 次内层迭代。
+//   旧（屏幕空间几何散射）：O(Σ 圆盘屏幕面积 × 重叠层数)，重叠区被反复着色。
+//   新：O(Σ 圆盘场纹素面积 + 场纹素数 + 屏幕像素数)，每个纹素只做一次整数原子比较。
 //
-// 视野圆之间的并集必须用 max 混合（见 C++ 侧的 TStaticBlendState<..., BO_Max, ...>）：
-// 圆盘外沿是软化段，若用覆盖写，后画的圆会在先画的圆上切出一道缺口。
+// 世界 → 场纹素：纹素 (x, y) 的采样中心 = FieldWorldMin + (xy + 0.5) * FieldTexelSizeCm
+// 场 → 屏幕（合成趟）：逐像素把自己的视口 UV 反投影到 Z = FogPlaneZ 平面。
+//
+// ⚠ 反投影必须在像素阶段逐像素做，不能放到顶点阶段靠插值传递。
+//   顶点着色器输出的 Position.w = 1，光栅器据此判定“无透视”，于是对顶点携带的附加量做屏幕空间
+//   线性插值；而“Z = FogPlaneZ 平面上的世界 XY”作为屏幕坐标的函数是有理函数（含透视除法），
+//   只有三角形的三个角上是对的，中间会被拉偏，且偏移量随俯仰角 / 距离变化 —— 症状就是雾随相机
+//   转动而相对场景滑移、形状被拉伸。视口 UV 与屏幕像素是线性关系，是顶点阶段唯一能安全插值的量。
 
 #include "/Engine/Public/Platform.ush"
 
-// 每个圆盘铺多少条三角形（外接正多边形）。16 条时面积只有圆面积的 1.013 倍：
-// 既把圆盘完整包住（否则多边形会把最外圈软化段切掉，变成硬边），过度绘制也只有 2%。
-#define VISION_SPLAT_TRIANGLES 16
+// 一个线程组负责一条视野源；组内线程按 8×8 的步长扫过该源的 AABB。
+#define VISION_FIELD_GROUP_SIZE 8
 
-// 每条视野源一个 float4：(WorldX, WorldY, Radius, Reserved)
-StructuredBuffer<float4> VisionSources;
+// ---------------------------------------------------------------------------------------------
+// 场几何与共享参数
+// ---------------------------------------------------------------------------------------------
 
-// 世界 → 裁剪空间（FSceneView::ViewMatrices.GetWorldToClip()）
-float4x4 WorldToClip;
+// 场纹素 (0, 0) 左上角对应的世界 XY（cm）。
+float2 FieldWorldMin;
 
-// 视野圆所在的世界 Z 平面（cm）
-float FogPlaneZ;
+// 场在世界空间中的尺寸（cm）：FieldTexelCount * FieldTexelSizeCm。
+float2 FieldWorldExtent;
 
-// 视野圆边缘软化宽度（cm）；0 = 硬边
+// 单个场纹素的世界边长（cm）。注意它不是"格尺寸 / 每格纹素数"的简写形式 ——
+// 场分辨率在 CPU 端会被上限 clamp，因此唯一自洽的定义是 世界尺寸 / 纹素数。
+float FieldTexelSizeCm;
+
+// 覆盖率定标分母（255）：场纹理里的整数覆盖率 = round(Coverage * VisionCoverageScale)。
+float VisionCoverageScale;
+
+// 视野圆边缘软化宽度（cm）；0 = 硬边。
 float SceneFogEdgeWidth;
 
-// 完全被雾覆盖区域的亮度（0 = 全黑，1 = 不压暗）
-float SceneFogNotVisibleRegionBrightness;
+// ---------------------------------------------------------------------------------------------
+// 趟 1：覆盖率的原子散射
+// ---------------------------------------------------------------------------------------------
+
+// 每条视野源一个 float4：(WorldX, WorldY, Radius, Reserved)。
+StructuredBuffer<float4> VisionSources;
+
+// 每条视野源在场空间里的保守 AABB：xy = 最小纹素（含），zw = 最大纹素（不含）。
+// CPU 端由"圆心 ± 半径"直接算成纹素矩形并 clamp 到场范围，不含任何投影。
+StructuredBuffer<uint4> VisionSourceAabbs;
+
+// 覆盖率场（定标 0..255 的整数）。本趟输出，趟 2 用作输入。
+RWTexture2D<uint> VisionCoverage;
+
+[numthreads(VISION_FIELD_GROUP_SIZE, VISION_FIELD_GROUP_SIZE, 1)]
+void VisionFieldSplatCS(uint3 GroupID : SV_GroupID, uint3 GroupThreadID : SV_GroupThreadID)
+{
+	// dispatch 的 Z 维就是源数：一个线程组 = 一条视野源，组内线程合计覆盖这条源的 AABB。
+	// 这就是"每源 AABB dispatch"的落地方式 —— 不派发任何与这条源无关的纹素，也就不存在空转。
+	const uint SourceIndex = GroupID.z;
+	const float4 Source = VisionSources[SourceIndex];
+	const uint4 Aabb = VisionSourceAabbs[SourceIndex];
+
+	const uint2 AabbMin = Aabb.xy;
+	const uint2 AabbMax = Aabb.zw;
+
+	const float Radius = max(Source.z, 0.0);
+	const float2 Center = Source.xy;
+	const float EdgeWidth = max(SceneFogEdgeWidth, 0.0);
+	const float SoftenStart = max(Radius - EdgeWidth, 0.0);
+
+	for (uint Y = AabbMin.y + GroupThreadID.y; Y < AabbMax.y; Y += VISION_FIELD_GROUP_SIZE)
+	{
+		for (uint X = AabbMin.x + GroupThreadID.x; X < AabbMax.x; X += VISION_FIELD_GROUP_SIZE)
+		{
+			const float2 TexelCenter = FieldWorldMin + (float2(X, Y) + 0.5) * FieldTexelSizeCm;
+			const float Distance = length(TexelCenter - Center);
+
+			// 圆内 1、圆外 0，边缘按 SceneFogEdgeWidth 在半径内侧软化。
+			// 软化宽度为 0 时走硬边分支：smoothstep 在 min == max 上是未定义行为，不能靠它退化。
+			float Coverage;
+			if (EdgeWidth > 0.0)
+			{
+				Coverage = 1.0 - smoothstep(SoftenStart, Radius, Distance);
+			}
+			else
+			{
+				Coverage = Distance < Radius ? 1.0 : 0.0;
+			}
+
+			if (Coverage <= 0.0)
+			{
+				continue;
+			}
+
+			// 原子取最大 —— 重叠圆盘取并集的全部实现。
+			// 重叠纹素会被多条源的线程反复触及，但每次只是一次整数原子比较：既没有像素着色器，
+			// 也没有混合单元，所以"重叠"在这里只剩原子竞争的成本，不再有旧实现那种逐层着色。
+			InterlockedMax(VisionCoverage[uint2(X, Y)], (uint)(Coverage * VisionCoverageScale + 0.5));
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// 趟 2：覆盖率 + 已探索 → PF_R8G8
+// ---------------------------------------------------------------------------------------------
+
+// 趟 1 的整数覆盖率（SRV 视图）。
+Texture2D<uint> VisionCoverageTexture;
+
+// 历史已探索层：LSB-first 位流（word i 的 bit b = 全局 bit i*32+b），与 CPU 侧权威探索层的位图
+// 同布局，因此从位图拷进来只需一次 memcpy，不需要在 CPU 端展开成逐格字节。
+// 它来自外部（MassBattleMap）而不是本插件自己攒的历史，因此本插件仍然不持有任何跨帧状态；
+// 没有提供者时给一个 0 元素的兜底，G 通道恒为 0，合成退化为阶段一的二态雾。
+StructuredBuffer<uint> VisionExploredBits;
+
+// 已探索位图的分辨率（格数）。
+int2 VisionExploredExtent;
+
+// 场分辨率（纹素数）：场与已探索层共用同一个世界矩形，UV 直接换算。
+int2 FieldTexelCount;
+
+/** 读一位已探索（坐标按边界 clamp，越界按最近的一格算）。 */
+float ReadExploredBit(int2 Coord)
+{
+	const int2 Clamped = clamp(Coord, int2(0, 0), VisionExploredExtent - 1);
+	const int Index = Clamped.y * VisionExploredExtent.x + Clamped.x;
+	return (float)((VisionExploredBits[Index >> 5] >> (Index & 31)) & 1u);
+}
+
+/**
+ * 已探索层的双线性采样。
+ *
+ * 不能用纹理采样器（数据是位流而非纹理），但插值必须自己做：已探索层是逐格二值的，而场通常比它细
+ * （一个格对应好几圈纹素）。点采样会让"已探索边界"在屏幕上呈现为整格的方块，双线性之后才是一条
+ * 跨格的过渡带 —— 这正是灰雾该有的样子。
+ */
+float SampleExploredBilinear(float2 FieldUV)
+{
+	// 场 UV → 已探索格坐标：UV * Extent 是格边界上的连续坐标，减 0.5 把它挪到格中心。
+	const float2 GridCoord = FieldUV * (float2)VisionExploredExtent - 0.5;
+	const int2 Base = (int2)floor(GridCoord);
+	const float2 Frac = saturate(GridCoord - (float2)Base);
+
+	const float2 Bottom = lerp(ReadExploredBit(Base + int2(0, 0)), ReadExploredBit(Base + int2(1, 0)), Frac.x);
+	const float2 Top = lerp(ReadExploredBit(Base + int2(0, 1)), ReadExploredBit(Base + int2(1, 1)), Frac.x);
+	return lerp(Bottom.x, Top.x, Frac.y);
+}
+
+float2 VisionFieldPackPS(float4 SvPosition : SV_Position) : SV_Target0
+{
+	// 覆盖率用 Load 而不是采样：整数场与输出纹素一一对应，点采样就是它唯一正确的读法。
+	const uint2 Texel = uint2(SvPosition.xy);
+	const float Coverage = (float)VisionCoverageTexture.Load(int3(Texel, 0)) * (1.0 / VisionCoverageScale);
+
+	const float2 FieldUV = (float2(Texel) + 0.5) / (float2)FieldTexelCount;
+	const float Explored = SampleExploredBilinear(FieldUV);
+
+	return float2(Coverage, Explored);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 趟 3：合成
+// ---------------------------------------------------------------------------------------------
 
 // xy = 缩放，zw = 偏移：把 [0,1] 的视口 UV 映射到对应纹理的 UV
 float4 SceneColorUVScaleBias;
-float4 CoverageMaskUVScaleBias;
+
+// 世界 → 裁剪空间的逆矩阵：把全屏三角形的角反投影回世界平面。
+float4x4 InvViewProjection;
+
+// 视野圆（以及视野场）所在的世界 Z 平面（cm）
+float FogPlaneZ;
+
+// 当前帧覆盖率与历史已探索打包成的 R8G8（R = 当前覆盖率，G = 已探索）
+Texture2D VisionFieldTexture;
+SamplerState VisionFieldSampler;
 
 Texture2D SceneColorTexture;
 SamplerState SceneColorSampler;
-Texture2D CoverageMaskTexture;
-SamplerState CoverageMaskSampler;
 
-struct FVisionSplatVSToPS
+// 从未被探索过的区域亮度（0 = 全黑，1 = 不压暗）
+float SceneFogNotVisibleRegionBrightness;
+
+// 已探索、但当前不可见区域的亮度：经典的"灰雾"。
+float SceneFogExploredRegionBrightness;
+
+// 雾层自身的不透明度：0 = 完全透明（画面就是原始场景色，看不出有雾），1 = 完全不透明（完全按亮度压暗）。
+// 它与上面两个亮度是正交的两件事：亮度决定"被遮住的地方压多暗"，本参数决定"这层遮蔽本身有多浓"。
+float SceneFogOpacity;
+
+/**
+ * NDC(x, y) 处的视线与 Z = FogPlaneZ 平面的交点世界 XY。
+ *
+ * 用两个不同的裁剪 z 反投影出两个有限远的世界点再作差，而不是"相机位置 + 近平面点"：
+ *  ① 不依赖远平面有限远（UE 的透视投影远平面在无穷远，z = 0 处的反投影 w 分量为 0，除法会炸）；
+ *  ② 不区分透视/正交 —— 正交相机的 ViewLocation 并不是像素射线的起点，用两点差天然绕开这个坑。
+ */
+float2 ClipToFogPlaneXY(float2 NDC)
 {
-	float4 Position : SV_Position;
+	const float4 NearWorld4 = mul(float4(NDC, 1.0, 1.0), InvViewProjection);
+	const float4 FarWorld4 = mul(float4(NDC, 0.5, 1.0), InvViewProjection);
+	const float3 NearWorld = NearWorld4.xyz / NearWorld4.w;
+	const float3 FarWorld = FarWorld4.xyz / FarWorld4.w;
 
-	// 该像素射线与 FogPlaneZ 平面的交点世界 XY。
-	// 三角形顶点都落在该平面上，透视校正插值后每个像素拿到的就是它自己的交点，无需再反投影。
-	float2 WorldXY : TEXCOORD0;
+	const float3 RayDir = FarWorld - NearWorld;
 
-	// 本条视野源（同一实例的所有像素相同，用 nointerpolation 省掉一次插值）
-	nointerpolation float2 CircleCenter : TEXCOORD1;
-	nointerpolation float CircleRadius : TEXCOORD2;
-};
-
-FVisionSplatVSToPS VisionSplatVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
-{
-	const float4 Source = VisionSources[InstanceID];
-	const float Radius = max(Source.z, 0.0);
-	const float2 Center = Source.xy;
-
-	// 每个圆盘 VISION_SPLAT_TRIANGLES 条三角形，每条 3 个顶点：
-	// CornerIndex == 0 是圆心，1 / 2 是第 TriangleIndex 与第 TriangleIndex + 1 个圆周点
-	//（最后一条回到 0° 把扇形闭合）。半径放大 1 / cos(π/N) 作外接多边形。
-	const uint TriangleIndex = VertexID / 3u;
-	const uint CornerIndex = VertexID % 3u;
-	const uint RimIndex = TriangleIndex + (CornerIndex == 0u ? 0u : CornerIndex - 1u);
-
-	const float AngleStep = 6.28318530718 / float(VISION_SPLAT_TRIANGLES);
-	const float SplatRadius = Radius / cos(3.14159265359 / float(VISION_SPLAT_TRIANGLES));
-	const float2 RimOffset = float2(cos(float(RimIndex) * AngleStep), sin(float(RimIndex) * AngleStep)) * SplatRadius;
-	const float2 Offset = CornerIndex == 0u ? float2(0.0, 0.0) : RimOffset;
-
-	const float2 WorldXY = Center + Offset;
-
-	FVisionSplatVSToPS Output;
-	Output.Position = mul(float4(WorldXY, FogPlaneZ, 1.0), WorldToClip);
-	Output.WorldXY = WorldXY;
-	Output.CircleCenter = Center;
-	Output.CircleRadius = Radius;
-	return Output;
-}
-
-float VisionSplatPS(FVisionSplatVSToPS Input) : SV_Target0
-{
-	const float Distance = length(Input.WorldXY - Input.CircleCenter);
-	const float Radius = max(Input.CircleRadius, 0.0);
-
-	// 圆内 1、圆外 0，边缘按 SceneFogEdgeWidth 在半径内侧软化。
-	// 软化宽度为 0 时走硬边分支：smoothstep 在 min == max 上是未定义行为，不能靠它退化。
-	float Coverage;
-	if (SceneFogEdgeWidth > 0.0)
+	// 视线与地面近乎平行时 RayDir.z → 0，交点跑到无穷远：此时该像素在地面上没有有限的对应点，
+	// 直接给一个必然落在场外的坐标（覆盖率与已探索都为 0，按"从未探索"处理）。
+	if (abs(RayDir.z) < 1e-3 * length(RayDir))
 	{
-		Coverage = 1.0 - smoothstep(max(Radius - SceneFogEdgeWidth, 0.0), Radius, Distance);
+		return float2(-1e9, -1e9);
 	}
-	else
-	{
-		Coverage = Distance < Radius ? 1.0 : 0.0;
-	}
-	return Coverage;
+
+	const float T = (FogPlaneZ - NearWorld.z) / RayDir.z;
+	return NearWorld.xy + T * RayDir.xy;
 }
 
 struct FCompositeVSToPS
 {
 	float4 Position : SV_Position;
 	float2 SceneColorUV : TEXCOORD0;
-	float2 CoverageMaskUV : TEXCOORD1;
+
+	// [0,1] 视口 UV（三角形角上为 [0,2]）。它与屏幕像素成线性关系，因此是顶点阶段唯一可以
+	// 安全交给光栅器插值的量；世界 XY 必须由它在像素阶段逐像素反投影得到。
+	float2 ViewportUV : TEXCOORD1;
 };
 
 FCompositeVSToPS CompositeVS(uint VertexID : SV_VertexID)
@@ -122,17 +250,42 @@ FCompositeVSToPS CompositeVS(uint VertexID : SV_VertexID)
 	FCompositeVSToPS Output;
 	Output.Position = float4(Corner.x * 2.0 - 1.0, 1.0 - Corner.y * 2.0, 0.0, 1.0);
 	Output.SceneColorUV = Corner * SceneColorUVScaleBias.xy + SceneColorUVScaleBias.zw;
-	Output.CoverageMaskUV = Corner * CoverageMaskUVScaleBias.xy + CoverageMaskUVScaleBias.zw;
+	Output.ViewportUV = Corner;
 	return Output;
 }
 
 float4 CompositePS(FCompositeVSToPS Input) : SV_Target0
 {
-	// 采样遮罩用双线性：遮罩可以是半分辨率，双线性顺带把边界软化到亚像素。
-	const float Coverage = saturate(CoverageMaskTexture.SampleLevel(CoverageMaskSampler, Input.CoverageMaskUV, 0).r);
+	// 采样场景色用双线性：场景色纹理可能比视口大（分屏时视图只占一块），UV 已经做过换算。
 	const float4 SceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, Input.SceneColorUV, 0);
 
-	// 与旧材质完全相同的合成语义：可见处用原色，不可见处压暗到 FogBrightness 倍。
-	const float Brightness = saturate(SceneFogNotVisibleRegionBrightness);
-	return float4(lerp(SceneColor.rgb * Brightness, SceneColor.rgb, Coverage), SceneColor.a);
+	// 视口 UV → NDC（Y 翻转：视口 UV 向下增长，NDC 向上），再逐像素反投影到世界平面。
+	const float2 NDC = float2(Input.ViewportUV.x * 2.0 - 1.0, 1.0 - Input.ViewportUV.y * 2.0);
+	const float2 FieldUV = (ClipToFogPlaneXY(NDC) - FieldWorldMin) / FieldWorldExtent;
+
+	// 场外（相机看向地图范围之外）：那里的世界位置既不可能落在任何视野圆内，也从未被探索过。
+	// 不能只靠 clamp 采样兜底 —— clamp 会把地图边缘那一列纹素一路拉伸到屏幕外，让地图外也亮起来。
+	float Coverage = 0.0;
+	float Explored = 0.0;
+	if (all(FieldUV >= 0.0) && all(FieldUV <= 1.0))
+	{
+		// 双线性采样同时服务于两件事：场纹素比屏幕像素粗时把边界软化到亚像素，
+		// 以及把探索层的格边界（0/255 二值）软化成一层灰雾过渡带。
+		const float2 Field = VisionFieldTexture.SampleLevel(VisionFieldSampler, FieldUV, 0).rg;
+		Coverage = saturate(Field.r);
+		Explored = saturate(Field.g);
+	}
+
+	// 三态合成：从未探索 → 压到 NotVisibleRegionBrightness；探索过但当前不可见 → 抬到
+	// ExploredRegionBrightness；当前可见 → 原色。两次 lerp 的先后无关紧要（两个量互相独立），
+	// 取 Coverage 在后是为了让"当前可见"永远赢过"已探索"。
+	float Brightness = SceneFogNotVisibleRegionBrightness;
+	Brightness = lerp(Brightness, SceneFogExploredRegionBrightness, Explored);
+	Brightness = lerp(Brightness, 1.0, Coverage);
+
+	const float3 FoggedColor = SceneColor.rgb * Brightness;
+
+	// 浓度：不透明度为 0 时这一层完全透出场景色，为 1 时才是上面那套完整的三态遮蔽。
+	// 当前可见的像素 Brightness 恒为 1（FoggedColor == SceneColor），因此这里只改变被遮蔽的像素。
+	return float4(lerp(SceneColor.rgb, FoggedColor, SceneFogOpacity), SceneColor.a);
 }

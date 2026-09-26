@@ -2,6 +2,7 @@
 
 #include "FogOfWar.h"
 
+#include "FogOfWarExploredLayerProvider.h"
 #include "FogOfWarMassBinding.h"
 #include "Camera/CameraTypes.h"
 #include "Camera/PlayerCameraManager.h"
@@ -26,7 +27,7 @@ namespace Names
 	const TCHAR* ScenePerformanceCsvRelativePath = TEXT("Logs/FogOfWar_ScenePerf.csv");
 
 	// 旧后处理材质路线的全部材质参数名（FOW_*）与那张视野源纹理，已随材质一起删除：
-	// 场景雾现在由 FFogOfWarSceneViewExtension 的两趟 pass 实现（覆盖率遮罩 + 合成），
+	// 场景雾现在由 FFogOfWarSceneViewExtension 的三趟 pass 实现（世界空间散射 + R8G8 打包 + 合成），
 	// 参数只有 C++ 属性这一个真值源，不再存在"材质资产里的默认值"与"C++ 每帧推送的值"
 	// 两份可能分叉的契约（FOW_FogEdgeWidth 先前就是这样被漏掉的）。
 }
@@ -34,10 +35,56 @@ namespace Names
 namespace
 {
 	/**
+	 * 视野场纹素数的每轴上限：约束场纹理的内存与散射遍历量。
+	 * 地图范围异常大（或没配到真实地图范围、落到缺省 WorldGridSize）时按比例放大纹素边长，
+	 * 而不是无限增大分辨率 —— 场变粗只是雾边变块状，而场爆表是直接分配失败。
+	 */
+	constexpr int32 VisionFieldMaxTexelsPerAxis = 2048;
+
+	/**
+	 * 由世界矩形与期望纹素边长算出视野场几何（本文件唯一实现）。
+	 *
+	 * 两轴共用一个缩放因子：分别 clamp 会让 X/Y 的纹素边长不一致，而着色器里的距离判定用的是
+	 * 单一 FieldTexelSizeCm，非均匀的场会把视野圆算成椭圆。
+	 * 纹素边长放大后重新按"世界尺寸 / 纹素边长"取整，保证场仍然铺满整个地图矩形
+	 * （若直接沿用期望边长，被截断的场只会覆盖地图的一角）。
+	 */
+	FFogOfWarSceneVisionField ComputeSceneFogVisionField(
+		const FVector2D& InWorldMin,
+		const FVector2D& InWorldSize,
+		float InDesiredTexelSizeCm)
+	{
+		FFogOfWarSceneVisionField Field;
+		Field.WorldMin = InWorldMin;
+		Field.WorldSize = InWorldSize;
+
+		if (InWorldSize.X <= 0.0f || InWorldSize.Y <= 0.0f)
+		{
+			// 地图范围未知：交出一个无效几何，渲染侧据此完全不注入 pass（雾消失），
+			// 而不是按 1×1 的场把整屏判成“从未探索”。
+			return Field;
+		}
+
+		const float SafeDesiredTexelSizeCm = FMath::Max(InDesiredTexelSizeCm, 1.0f);
+		const float DesiredX = InWorldSize.X / SafeDesiredTexelSizeCm;
+		const float DesiredY = InWorldSize.Y / SafeDesiredTexelSizeCm;
+		const float MaxDesired = FMath::Max(DesiredX, DesiredY);
+		const float UniformScale = (MaxDesired > static_cast<float>(VisionFieldMaxTexelsPerAxis))
+			? (static_cast<float>(VisionFieldMaxTexelsPerAxis) / MaxDesired)
+			: 1.0f;
+
+		Field.TexelSizeCm = SafeDesiredTexelSizeCm / UniformScale;
+		Field.TexelCount = FIntPoint(
+			FMath::Max(1, FMath::CeilToInt(static_cast<float>(InWorldSize.X) / Field.TexelSizeCm)),
+			FMath::Max(1, FMath::CeilToInt(static_cast<float>(InWorldSize.Y) / Field.TexelSizeCm)));
+		return Field;
+	}
+
+	/**
 	 * 圆盘包含判定：InA 的圆盘是否完全落在 InB 的圆盘之内（等价于 dist(A,B) + rA <= rB）。
 	 *
-	 * 为什么删掉被包含的源是严格等价的：散射遮罩取的是所有源的覆盖率最大值（max 混合），A 若能揭开某个像素，
-	 * 则覆盖该像素的 B 一定能揭开它、且覆盖率不低于 A。所以这是集合等价，不是近似 —— 与视图剔除
+	 * 为什么删掉被包含的源是严格等价的：散射场取的是所有源的覆盖率最大值（整数原子取最大），A 若能揭开某个纹素，
+	 * 则覆盖该纹素的 B 一定能揭开它、且覆盖率不低于 A。所以这是集合等价，不是近似 —— 与视图剔除
 	 * 同一性质（精确优化），而不是"看起来差不多"的启发式裁剪。
 	 *
 	 * 入参约定：x/y 为世界 XY，z 为生效揭雾半径（已含 SceneGpuVisionSourceRadiusPadding），w 未用。
@@ -146,8 +193,13 @@ void AFogOfWar::Activate()
 		MinimapSubsystem->SetVisionGridActive(false);
 	}
 
+	// 新的扩展实例没有任何已探索层快照，必须把"上一次采用的版本号"一并作废：
+	// Actor 在同一进程里被复用（换图重进 / PIE 重开）时，版本号若沿用旧值，
+	// 下面那句"版本没变就不重新取"会让新扩展永远收不到已探索层，灰雾整场不出现。
+	SceneFogExploredLayerSourceVersion = INDEX_NONE;
+
 	// 场景雾的 GPU 实现是一个"世界作用域"的 SceneViewExtension：注册之后，该世界所有视图的
-	// Tonemap 之后都会插入 FFogOfWarSceneViewExtension 的两趟 pass（散射遮罩 + 合成）。
+	// Tonemap 之后都会插入 FFogOfWarSceneViewExtension 的三趟 pass（散射场 + 打包 + 合成）。
 	// 反注册靠成员释放完成（引擎会把当帧引用留到渲染结束），不需要额外的 Deactivate。
 	if (UWorld* World = GetWorld())
 	{
@@ -501,16 +553,63 @@ void AFogOfWar::UploadSceneGpuVisionSources()
 		return;
 	}
 
+	// 观察队伍：既决定视野源过滤（收集阶段已经用过一次），也决定向提供者要哪一支队伍的探索层。
+	const int32 ViewingTeamIndex = FFogOfWarViewingTeamProvider::GetViewingTeam(this);
+
+	// 场几何与已探索层共用同一次查询：提供者给出的地图矩形就是逐格探索层的矩形，
+	// 而视野场必须与它同矩形（G 通道直接沿用场的 UV），否则灰雾会整体错位。
+	// 拿不到提供者时退回本 Actor 自己的网格范围（WorldGridSize 派生的那份），此时只有二态雾。
+	FVector2D FieldWorldMin = GridBottomLeftWorldLocation;
+	FVector2D FieldWorldSize = GridSize;
+
+	FFogOfWarExploredLayerView ExploredView;
+	if (FFogOfWarExploredLayerProvider::GetExploredLayer(ViewingTeamIndex, ExploredView))
+	{
+		FieldWorldMin = ExploredView.WorldMin;
+		FieldWorldSize = ExploredView.WorldSize;
+
+		// 版本号不变就不重新取：探索层每秒只变几次，而这里是每帧一次。
+		if (ExploredView.Version != SceneFogExploredLayerSourceVersion)
+		{
+			const int64 CellCount = static_cast<int64>(ExploredView.Width) * static_cast<int64>(ExploredView.Height);
+			const int32 ByteCount = static_cast<int32>((CellCount + 7) / 8);
+
+			// 位打包布局与外部位图完全一致（都是 LSB-first 位流），所以这里只是一次 memcpy：
+			// 不需要在 CPU 端展开成逐格字节，也就不需要为展开准备任何中间缓冲。
+			// 先清零再拷——位图的字节数不一定是 4 的倍数，最后一个 word 的高位必须保持 0，
+			// 否则那几个位会被着色器当成“已探索”。
+			FFogOfWarSceneExploredLayer ExploredLayer;
+			ExploredLayer.PackedBits.SetNumZeroed(static_cast<int32>((CellCount + 31) / 32));
+			FMemory::Memcpy(ExploredLayer.PackedBits.GetData(), ExploredView.Bitmap, ByteCount);
+			ExploredLayer.Extent = FIntPoint(ExploredView.Width, ExploredView.Height);
+			ExploredLayer.Version = ExploredView.Version;
+
+			SceneFogExploredLayerSourceVersion = ExploredView.Version;
+			SceneFogViewExtension->UploadExploredLayer_GameThread(ExploredLayer);
+		}
+	}
+	else if (SceneFogExploredLayerSourceVersion != INDEX_NONE)
+	{
+		// 提供者不可用（未注册 / 网格未就绪 / 观察队伍不可用）：主动清掉灰雾让画面回到二态，
+		// 而不是继续展示上一次的快照 —— 那份数据可能属于另一张地图或另一支队伍。
+		SceneFogExploredLayerSourceVersion = INDEX_NONE;
+		SceneFogViewExtension->UploadExploredLayer_GameThread(FFogOfWarSceneExploredLayer());
+	}
+
 	// 参数快照与视野源一起交给渲染线程：渲染线程只认这一份，既保证同帧一致，
 	// 也让这些旋钮在 PIE 里改动能立刻生效（不必重启场景）。
 	FFogOfWarSceneFogSettings Settings;
 	Settings.EdgeWidthCm = FMath::Max(FogEdgeWidth, 0.0f);
 	Settings.NotVisibleRegionBrightness = FMath::Clamp(NotVisibleRegionBrightness, 0.0f, 1.0f);
+	Settings.ExploredRegionBrightness = FMath::Clamp(ExploredRegionBrightness, 0.0f, 1.0f);
+	Settings.Opacity = FMath::Clamp(SceneFogOpacity, 0.0f, 1.0f);
 	Settings.PlaneZ = SceneFogWorldPlaneZ;
-	Settings.MaskResolutionDivisor = FMath::Clamp(SceneGpuVisionMaskResolutionDivisor, 1, 4);
 
 	// 清单本身会被交换走，换回来的是上一帧用过的缓冲（见调用方开头的 Reset）。
-	SceneFogViewExtension->UploadFrameData_GameThread(SceneGpuVisionSources, Settings);
+	SceneFogViewExtension->UploadFrameData_GameThread(
+		SceneGpuVisionSources,
+		Settings,
+		ComputeSceneFogVisionField(FieldWorldMin, FieldWorldSize, VisionFieldTexelSizeCm));
 }
 
 int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& OutSourcesByTeam, int32 InTeamCount, int32* OutHighestTeamIndexSeen) const
