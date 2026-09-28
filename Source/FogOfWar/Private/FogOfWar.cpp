@@ -125,6 +125,9 @@ namespace
 	 * @param InRadiusPaddingCm 生效半径余量（AFogOfWar::SceneGpuVisionSourceRadiusPadding）。
 	 * @param OutRadiusCm       输出：生效揭雾半径 = SightRadius + 余量。
 	 * @param OutTeamIndex      可选输出：该 Agent 的队伍下标（无队伍碎片时为 INDEX_NONE）。
+	 * @param OutSightRadiusCm  可选输出：未加余量的原始视距（= FMassVisionFragment::SightRadius）。
+	 *                          给需要"当前可见性判定"的消费者用：可见性必须按真实视距算，
+	 *                          含渲染余量的半径只适合描述"被揭开的画面范围"。
 	 * @return 是否为有效视野源。
 	 */
 	bool TryGetVisionSourceRadius(
@@ -133,7 +136,8 @@ namespace
 		int32 InTeamIndex,
 		float InRadiusPaddingCm,
 		float& OutRadiusCm,
-		int32* OutTeamIndex = nullptr)
+		int32* OutTeamIndex = nullptr,
+		float* OutSightRadiusCm = nullptr)
 	{
 		if (!InEntityManager.IsEntityValid(InAgentData.EntityHandle))
 		{
@@ -166,7 +170,12 @@ namespace
 		}
 
 		// ③ 生效半径 = 单体视距 + 场景揭雾余量（与交给 GPU 的口径一致，避免探索层比画面小一圈）。
+		//    原始视距单独回传：可见性判定要用它（见参数说明），此处不做任何加工，两个口径同源同一碎片。
 		OutRadiusCm = VisionFragment->SightRadius + InRadiusPaddingCm;
+		if (OutSightRadiusCm)
+		{
+			*OutSightRadiusCm = VisionFragment->SightRadius;
+		}
 		return true;
 	}
 }
@@ -653,13 +662,15 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 				// 越界队伍因此也能被计入 OutHighestTeamIndexSeen（自检用），而不是被静默丢弃。
 				int32 AgentTeamIndex = INDEX_NONE;
 				float RadiusCm = 0.0f;
+				float SightRadiusCm = 0.0f;
 				if (!TryGetVisionSourceRadius(
 					EntityManager,
 					AgentData,
 					INDEX_NONE,
 					SceneGpuVisionSourceRadiusPadding,
 					RadiusCm,
-					&AgentTeamIndex))
+					&AgentTeamIndex,
+					&SightRadiusCm))
 				{
 					continue;
 				}
@@ -687,6 +698,7 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 				FFogVisionSource& Out = TeamSources.AddDefaulted_GetRef();
 				Out.WorldLocation = FVector2D(WorldLocation.X, WorldLocation.Y);
 				Out.RadiusCm = RadiusCm;
+				Out.SightRadiusCm = SightRadiusCm;
 				++TotalSources;
 			}
 		}

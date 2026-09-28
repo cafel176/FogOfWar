@@ -30,6 +30,15 @@ struct FOGOFWAR_API FFogVisionSource
 
 	/// @brief 生效揭雾半径（cm，已含 SceneGpuVisionSourceRadiusPadding）。
 	float RadiusCm = 0.0f;
+
+	/// @brief 原始视距（cm，= FMassVisionFragment::SightRadius，**未**叠加 SceneGpuVisionSourceRadiusPadding）。
+	/// @details 与 RadiusCm 是两个口径，用途不同，不要混用：
+	///          - RadiusCm：渲染/揭雾口径，含投影余量，用于"被揭开的画面范围"（探索层累积用这个，
+	///            否则探索层会比画面小一圈）；
+	///          - 本字段：模型口径，"这个单位能看多远"。需要**当前可见性判定**的 CPU 消费者
+	///            （如地图的当前可见层 → RL 观测的 bVisible）必须用本字段 —— 余量是给抖动/投影留的
+	///            缓冲（默认 300cm），拿它做可见性判定等于凭空放大视野，让"看不见的敌人"被标成可见。
+	float SightRadiusCm = 0.0f;
 };
 
 /// 声明一个全局的日志分类，用于本模块的日志输出
