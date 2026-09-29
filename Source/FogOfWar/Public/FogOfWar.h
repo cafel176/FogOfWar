@@ -122,8 +122,23 @@ public:
 	/// @brief 每帧最多交给 GPU 的视野源数量，超出时按 HashGrid 遍历顺序截断。
 	/// @note 新实现里这个上限只决定"每帧散射多少个圆盘"，不再像旧材质那样直接决定内层循环次数，
 	///       因此它从"性能生死线"降级为"异常情况下的保险丝"。
+	///       它只约束**渲染侧**：CPU 侧逐队收集（探索层累积）另有一条独立上限 MaxCpuVisionSourcesPerTeam，
+	///       两者性质完全不同（一个是渲染预算，一个是逻辑语义），**不要**为了让探索层"多看见一点"来调这条。
+	///       默认 8192：本工程实测单队可达 6000+ 单位，4096 会让每个队伍持续丢掉一部分单位的视野。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "1", UIMin = "1"))
-	int32 MaxSceneGpuVisionSources = 4096;
+	int32 MaxSceneGpuVisionSources = 8192;
+
+	/// @brief 每队交给 **CPU 侧消费者**（探索层累积）的视野源上限；0 = 不限（默认）。
+	/// @details 与 MaxSceneGpuVisionSources 是两件事，故意不共用：
+	///          - 那条是**渲染预算**的保险丝，且 GPU 侧在截断前已经做了视图剔除 + 格内圆盘包含剔除；
+	///          - 本属性约束的是**逻辑语义** —— CPU 探索层的定义就是"该队所有视野源的并集"，
+	///            一旦截断，同队就有一部分单位的视野凭空消失，且丢谁取决于 HashGrid 遍历顺序
+	///            （同一局面两次运行可能不同，不可复现）。CPU 侧也没有可用的剔除依据：
+	///            探索层是全图历史，不能按本机视口/相机距离裁剪。
+	///          因此默认 0（不限）。确需为极端规模设保险丝时，它只是"性能兜底"，设小了直接损失探索精度
+	///          （触发时会有限频告警，见 .cpp 内的 CollectVisionSourcesByTeam）。
+	UPROPERTY(EditAnywhere, Category = "FogOfWar|CPU", meta = (ClampMin = "0", UIMin = "0"))
+	int32 MaxCpuVisionSourcesPerTeam = 0;
 
 	/// @brief 交给 GPU 的每个视野源额外半径。用于抵消 hash/cell/投影边缘误差，避免漏视野。
 	/// @details 这个余量同时吸收了"视野圆按世界 Z 平面投影、而像素所在表面可能高出一截"带来的
@@ -240,7 +255,8 @@ public:
 	 *              生效半径 = SightRadius + SceneGpuVisionSourceRadiusPadding，并按 FTeam::index 归队。
 	 *              与 GPU 侧只有两点不同：① 不按"当前观察队伍"过滤，而是每个队伍各一份；
 	 *              ② 不受 bEnableSceneGpuVisionSources 开关影响（那是渲染开关，而探索累积属于
-	 *              逻辑/观测需求）。每队的收集上限同为 MaxSceneGpuVisionSources。
+	 *              逻辑/观测需求）。每队的收集上限是 MaxCpuVisionSourcesPerTeam（默认 0 = 不限，
+	 *              与渲染侧的 MaxSceneGpuVisionSources 解耦：见该属性注释里"两条上限性质不同"的说明）。
 	 *              本插件只维护"当前帧可见性"，不保存历史探索状态 —— 需要"累积已探索"的
 	 *              消费者（如地图探索层）应自行累积本接口给出的视野源。
 	 * @param       OutSourcesByTeam        数据类型: TArray<TArray<FFogVisionSource>>&

@@ -642,7 +642,18 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 	}
 
 	const FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
-	const int32 SafeMaxSources = FMath::Max(1, MaxSceneGpuVisionSources);
+
+	// 每队上限：0 = 不限（默认）。**故意不与渲染侧的 MaxSceneGpuVisionSources 共用** ——
+	// 那条是渲染预算的保险丝（且 GPU 侧截断前已做过视图剔除 + 圆盘包含剔除），而本函数服务的是
+	// "该队所有视野源的并集"这条逻辑语义，CPU 侧没有任何可用的剔除依据（探索层是全图历史，
+	// 不能按本机视口裁剪），所以任何截断都只会让探索层凭空缺一块。
+	const int32 TeamSourceLimit = FMath::Max(0, MaxCpuVisionSourcesPerTeam);
+
+	// ★【诊断】被上限丢弃的源数。只在显式配了 CPU 侧保险丝（TeamSourceLimit > 0）时才可能非零：
+	//   - 丢掉哪些取决于 HashGrid 遍历顺序 → 同一局面两次运行的探索层可能不同（不可复现）；
+	//   - 视距较小时（圆盘远小于地图）会真的缺掉一整支部队覆盖的区域，而画面/日志上都看不出来。
+	// 把"丢了多少"记下来并限频告警，避免这种精度损失被性能数字掩盖。
+	int32 TruncatedSources = 0;
 
 	int32 TotalSources = 0;
 	for (const TPair<FIntVector, TSharedPtr<FAgentGridBlock>>& BlockPair : HashGrid->AgentGrid)
@@ -686,10 +697,11 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 					continue;
 				}
 
-				// 每队各自受 MaxSceneGpuVisionSources 上限约束（与 GPU 侧同一口径）。
+				// 每队各自受 MaxCpuVisionSourcesPerTeam 约束；默认 0 = 不限，因此常态下这里不会截断。
 				TArray<FFogVisionSource>& TeamSources = OutSourcesByTeam[AgentTeamIndex];
-				if (TeamSources.Num() >= SafeMaxSources)
+				if (TeamSourceLimit > 0 && TeamSources.Num() >= TeamSourceLimit)
 				{
+					++TruncatedSources; // ★【诊断】本队名额已满（仅在显式设了 CPU 侧保险丝时可能发生）
 					continue;
 				}
 
@@ -701,6 +713,24 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 				Out.SightRadiusCm = SightRadiusCm;
 				++TotalSources;
 			}
+		}
+	}
+
+	// ★【诊断】截断告警（限频 10s，避免每次刷新都刷屏）：把"静默丢数据"变成一条明确记录。
+	// 本函数在刷新路径上每次调用一次（本工程约每 2s），限频后最多每 10s 一条。
+	if (TruncatedSources > 0)
+	{
+		static double LastTruncWarnTime = -1.0;
+		const double NowSeconds = World ? World->GetTimeSeconds() : 0.0;
+		if (LastTruncWarnTime < 0.0 || (NowSeconds - LastTruncWarnTime) >= 10.0)
+		{
+			LastTruncWarnTime = NowSeconds;
+			UE_LOG(LogFogOfWar, Warning,
+				TEXT("[诊断] 视野源被每队上限截断 %d 条（MaxCpuVisionSourcesPerTeam=%d，该队名额已满，按 HashGrid 遍历顺序丢弃靠后的单位）。")
+				TEXT("被丢源的视野不进入当前可见层与已探索层：探索层结果因此取决于遍历顺序（不可复现），")
+				TEXT("视距远小于地图时还会真的缺掉一整片区域。这是显式设置的 CPU 侧保险丝所致，")
+				TEXT("默认 0（不限）不会有此问题；要恢复完整探索请把它调回 0 或调到不小于同队最大单位数。"),
+				TruncatedSources, TeamSourceLimit);
 		}
 	}
 
