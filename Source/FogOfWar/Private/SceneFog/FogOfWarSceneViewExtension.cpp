@@ -17,6 +17,8 @@
 #include "RHIStaticStates.h"
 #include "ScreenPass.h"
 #include "ShaderParameterStruct.h"
+#include "SceneRenderTargetParameters.h" // 场景纹理相关的公共定义（ESceneTextureSetupMode 等）
+#include "SceneTexturesConfig.h"         // FSceneTextureUniformParameters：合成趟读场景深度用的 uniform buffer
 
 namespace
 {
@@ -147,6 +149,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FFogOfWarSceneCompositePassParameters, )
 
 	/** 覆盖率 + 已探索打包成的 R8G8。 */
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VisionFieldTexture)
+
+	/** 场景纹理 uniform buffer（含场景深度）：像素反投影用；RDG 依赖由这份 pass 结构登记。 */
+	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, SceneTexturesStruct)
 END_SHADER_PARAMETER_STRUCT()
 
 /**
@@ -204,6 +209,14 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VisionFieldTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, VisionFieldSampler)
+
+		/**
+		 * 场景纹理 uniform buffer（引擎约定名 SceneTexturesStruct，usf 侧同名访问）。
+		 * 合成趟从它的 SceneDepthTexture 读 device z，把像素反投影回它真实所在的世界位置，
+		 * 而不是投到固定 Z 平面 —— 否则斜视 / 地形起伏时雾会相对场景滑移。
+		 * 非 deferred / 未提供时该成员为空，着色器保持 DeviceZ = 0 并退回平面投影。
+		 */
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, SceneTexturesStruct)
 		SHADER_PARAMETER(float, SceneFogNotVisibleRegionBrightness)
 		SHADER_PARAMETER(float, SceneFogExploredRegionBrightness)
 
@@ -478,11 +491,14 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 		FIntRect(0, 0, FieldExtent.X, FieldExtent.Y));
 
 	// ---- 趟 3：合成 ----
+
 	const FIntPoint SceneColorExtent = SceneColor.Texture->Desc.Extent;
 
 	auto* CompositePassParameters = GraphBuilder.AllocParameters<FFogOfWarSceneCompositePassParameters>();
 	CompositePassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
 	CompositePassParameters->SceneColorTexture = SceneColor.Texture;
+	// 场景纹理 uniform buffer（含深度）：直接沿用引擎在后处理链上准备好的那一份。
+	CompositePassParameters->SceneTexturesStruct = Inputs.SceneTextures.SceneTextures;
 	CompositePassParameters->VisionFieldTexture = VisionFieldTexture;
 
 	// 反投影矩阵只在像素阶段用（顶点阶段交给光栅器插值的必须是屏幕空间线性量），因此它属于
@@ -502,6 +518,7 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 	CompositePSParameters.FieldWorldMin = FieldWorldMin;
 	CompositePSParameters.FieldWorldExtent = FieldWorldExtent;
 	CompositePSParameters.SceneColorTexture = SceneColor.Texture;
+	CompositePSParameters.SceneTexturesStruct = Inputs.SceneTextures.SceneTextures;
 	CompositePSParameters.SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	CompositePSParameters.VisionFieldTexture = VisionFieldTexture;
 	CompositePSParameters.VisionFieldSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();

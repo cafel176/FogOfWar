@@ -20,7 +20,8 @@
 //   新：O(Σ 圆盘场纹素面积 + 场纹素数 + 屏幕像素数)，每个纹素只做一次整数原子比较。
 //
 // 世界 → 场纹素：纹素 (x, y) 的采样中心 = FieldWorldMin + (xy + 0.5) * FieldTexelSizeCm
-// 场 → 屏幕（合成趟）：逐像素把自己的视口 UV 反投影到 Z = FogPlaneZ 平面。
+// 场 → 屏幕（合成趟）：逐像素用视口 UV + 场景深度反投影回真实世界位置，再换算成场 UV。
+//   （深度不可用时退回 Z = FogPlaneZ 平面投影，见 PixelWorldXYFromDepth。）
 //
 // ⚠ 反投影必须在像素阶段逐像素做，不能放到顶点阶段靠插值传递。
 //   顶点着色器输出的 Position.w = 1，光栅器据此判定“无透视”，于是对顶点携带的附加量做屏幕空间
@@ -29,6 +30,11 @@
 //   转动而相对场景滑移、形状被拉伸。视口 UV 与屏幕像素是线性关系，是顶点阶段唯一能安全插值的量。
 
 #include "/Engine/Public/Platform.ush"
+
+// SceneTexturesStruct：引擎约定名的场景纹理 uniform buffer（deferred 路径下才有），
+// 合成趟从中读场景深度做像素反投影。C++ 侧以
+// SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, SceneTexturesStruct) 声明。
+#include "/Engine/Private/SceneTexturesCommon.ush"
 
 // 一个线程组负责一条视野源；组内线程按 8×8 的步长扫过该源的 AABB。
 #define VISION_FIELD_GROUP_SIZE 8
@@ -231,6 +237,52 @@ float2 ClipToFogPlaneXY(float2 NDC)
 	return NearWorld.xy + T * RayDir.xy;
 }
 
+/**
+ * 像素**真实所在**的世界 XY：用场景深度把该像素反投影回世界空间。
+ *
+ * 为什么必须用深度而不是平面求交：视野场是纯 XY 的世界场，圆盘是水平圆（覆盖所有 Z），
+ * 所以一个像素只要知道自己的真实 XY 就能严格采样 —— 与相机角度、与像素高度都无关。
+ * 而 ClipToFogPlaneXY 假设"像素表面就躺在 FogPlaneZ 平面上"，这是个近似：
+ * 表面高出该平面 h 时对应关系会偏掉约 h / tan(俯仰角)，俯角越小偏得越多；
+ * 地形起伏处各像素的 h 还各不相同，症状就是雾边被拉伸、且随相机转动相对场景滑移。
+ *
+ * ⚠ 深度必须按**视口 UV**（InViewportUV）采样，不能用场景色 UV：场景色纹理会自带一份
+ * UVScaleBias（本工程实测 0.708 —— 视口内容只占它的一角），而场景深度覆盖整个渲染分辨率，
+ * 与视口 UV 一一对应。拿场景色 UV 去采深度，采到的是"另一个屏幕位置"的深度：值仍然有效
+ * （不是 0），所以反投影看起来在正常工作，但世界位置整体偏移 —— 表现为雾随相机推拉而错位。
+ *
+ * 两个退化情形退回平面投影（那里没有有限的对应点，且必然落在场外 → 按"未探索"处理）：
+ *  ① reverse-Z 下 device z 为 0（天空 / 无几何）；
+ *  ② 反投影得到的 w 为 0。
+ */
+float2 PixelWorldXYFromDepth(float2 NDC, float2 InViewportUV)
+{
+#if SHADING_PATH_MOBILE
+	// 移动端深度不在 SceneTexturesStruct 里（走 MobileSceneTextures），这里不接：退回平面投影。
+	return ClipToFogPlaneXY(NDC);
+#else
+	// 按**深度纹理自己的尺寸**把视口 UV 换算成纹素坐标：两者分辨率常常不同（TAAU/TSR 场景下
+	// 场景色与深度不是一个分辨率），所以只能用它自己的尺寸，不能借用场景色的。
+	uint DepthWidth = 0;
+	uint DepthHeight = 0;
+	SceneTexturesStruct.SceneDepthTexture.GetDimensions(DepthWidth, DepthHeight);
+	const int2 DepthPixel = int2(InViewportUV * float2(DepthWidth, DepthHeight));
+	const float DeviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(DepthPixel, 0)).r;
+
+	if (DeviceZ <= 0.0f)
+	{
+		return ClipToFogPlaneXY(NDC);
+	}
+
+	const float4 World4 = mul(float4(NDC, DeviceZ, 1.0), InvViewProjection);
+	if (abs(World4.w) < 1e-6)
+	{
+		return ClipToFogPlaneXY(NDC);
+	}
+	return World4.xy / World4.w;
+#endif
+}
+
 struct FCompositeVSToPS
 {
 	float4 Position : SV_Position;
@@ -259,9 +311,10 @@ float4 CompositePS(FCompositeVSToPS Input) : SV_Target0
 	// 采样场景色用双线性：场景色纹理可能比视口大（分屏时视图只占一块），UV 已经做过换算。
 	const float4 SceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, Input.SceneColorUV, 0);
 
-	// 视口 UV → NDC（Y 翻转：视口 UV 向下增长，NDC 向上），再逐像素反投影到世界平面。
+	// 视口 UV → NDC（Y 翻转：视口 UV 向下增长，NDC 向上），再逐像素反投影到该像素真实世界位置。
+	// 注意是"真实位置"而不是"投到 FogPlaneZ 平面"：后者在斜视与地形起伏下会让雾相对场景滑移。
 	const float2 NDC = float2(Input.ViewportUV.x * 2.0 - 1.0, 1.0 - Input.ViewportUV.y * 2.0);
-	const float2 FieldUV = (ClipToFogPlaneXY(NDC) - FieldWorldMin) / FieldWorldExtent;
+	const float2 FieldUV = (PixelWorldXYFromDepth(NDC, Input.ViewportUV) - FieldWorldMin) / FieldWorldExtent;
 
 	// 场外（相机看向地图范围之外）：那里的世界位置既不可能落在任何视野圆内，也从未被探索过。
 	// 不能只靠 clamp 采样兜底 —— clamp 会把地图边缘那一列纹素一路拉伸到屏幕外，让地图外也亮起来。
