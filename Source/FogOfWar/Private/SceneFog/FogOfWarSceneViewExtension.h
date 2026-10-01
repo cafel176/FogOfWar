@@ -133,13 +133,21 @@ public:
 	 *                     换回来的是上一帧用过的缓冲，交给调用方 Reset 后复用，两侧都不产生分配。
 	 * @param InSettings   本帧雾参数快照。
 	 * @param InField      本帧视野场几何（世界矩形 + 分辨率）。
+	 * @param bInSceneFogActive 本帧是否应该用雾遮蔽画面 —— **与"有没有视野源"是两件事**：
+	 *                     ① 雾系统被关掉 / 子系统不可用 → false：渲染侧完全不注入 pass，画面不受遮蔽
+	 *                        （这是"我不想画雾"）；
+	 *                     ② 雾系统正常、但本帧一条视野源都没有（例如相机移出了所有单位的视野范围，
+	 *                        或视野源被视图剔除干净）→ true：仍然注入 pass，覆盖率场全 0，
+	 *                        合成结果是"整屏从未探索" —— 即**全遮蔽**。这才是"什么都看不见"的正确表现，
+	 *                        而不是让迷雾凭空消失。
 	 * @note 这里只做一次加锁交换，不碰任何 RHI 资源：GPU 侧的缓冲/纹理全部在渲染线程按帧创建，
 	 *       游戏线程不参与图形资源管理。
 	 */
 	void UploadFrameData_GameThread(
 		TArray<FVector4f>& InOutSources,
 		const FFogOfWarSceneFogSettings& InSettings,
-		const FFogOfWarSceneVisionField& InField);
+		const FFogOfWarSceneVisionField& InField,
+		bool bInSceneFogActive);
 
 	/**
 	 * @brief 游戏线程：交出历史已探索层（只在内容真的变化时调用）。
@@ -152,7 +160,9 @@ public:
 private:
 	/**
 	 * @brief 渲染线程：Tonemap 之后插入“散射场 + 打包 + 合成”三趟 pass。
-	 * @details 若本帧没有视野源或场几何不可用，则直接返回输入场景色，连一次全屏 pass 都不产生。
+	 * @details 若本帧不应遮蔽（雾系统关闭）或场几何不可用，则直接返回输入场景色，连一次全屏 pass
+	 *          都不产生；而“雾该画、只是本帧没有视野源”**不**在这里早退 —— 那正是需要跑一趟、
+	 *          把整屏按“从未探索”遮蔽掉的情况。
 	 */
 	FScreenPassTexture PostProcess_RenderThread(
 		FRDGBuilder& GraphBuilder,
@@ -166,6 +176,10 @@ private:
 	FFogOfWarSceneVisionField PendingField;
 	FFogOfWarSceneExploredLayer PendingExploredLayer;
 
+	/** 本帧是否应该用雾遮蔽画面（与"有没有视野源"是两件事，见 UploadFrameData_GameThread）。
+	 *  false = 雾系统关闭 / 子系统不可用 → 渲染侧完全不注入 pass，画面不受遮蔽。 */
+	bool PendingSceneFogActive = true;
+
 	/**
 	 * @brief 渲染线程私有的本帧快照。
 	 * @details SubscribeToPostProcessingPass 与随后的回调都在渲染线程执行，且在同一帧内先后发生，
@@ -175,6 +189,9 @@ private:
 	TArray<FVector4f> RenderThreadSources;
 	FFogOfWarSceneFogSettings RenderThreadSettings;
 	FFogOfWarSceneVisionField RenderThreadField;
+
+	/** 渲染线程手里的"本帧是否应遮蔽"快照（含义见 UploadFrameData_GameThread）。 */
+	bool RenderThreadSceneFogActive = true;
 
 	/// @brief 渲染线程手里的已探索层快照；只在 Pending 的版本号变化时才重新拷贝（见 UploadExploredLayer_GameThread）。
 	FFogOfWarSceneExploredLayer RenderThreadExploredLayer;

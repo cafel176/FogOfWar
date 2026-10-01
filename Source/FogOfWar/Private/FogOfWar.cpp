@@ -388,9 +388,11 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	UMassBattleHashGridSubsystem* HashGrid = World ? World->GetSubsystem<UMassBattleHashGridSubsystem>() : nullptr;
 	if (!EntitySubsystem || !HashGrid)
 	{
-		// 收集不到（开关关闭 / 子系统缺失 / 世界正在销毁）时交出一份空表：渲染侧据此完全不注入
-		// pass，雾直接消失，而不是停在上一帧的旧圆盘上。
-		UploadSceneGpuVisionSources();
+		// 雾系统不可用（开关关闭 / 子系统缺失 / 世界正在销毁）：告诉渲染侧"本帧不遮蔽"，画面完全不受
+		// 迷雾影响，而不是停在上一帧的旧圆盘上。
+		// 注意这与"有雾、但本帧一条源都没收到"是两种不同语义：后者走下面的正常路径
+		// （bSceneFogActive = true），由"覆盖率场全 0"表达成整屏遮蔽 —— 那才是正确的画面。
+		UploadSceneGpuVisionSources(/*bSceneFogActive=*/false);
 		return;
 	}
 
@@ -545,7 +547,10 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	const int32 SourceCount = SceneGpuVisionSources.Num();
 
 	const double UploadStartTime = FPlatformTime::Seconds();
-	UploadSceneGpuVisionSources();
+	// 走到这里说明雾系统本身是好的（开关开着、子系统存在），因此本帧一律要遮蔽画面：
+	// 即使一条视野源都没收到（相机移出所有单位的视野范围，或源被视图剔除干净），
+	// 也应该表现为整屏迷雾，而不是迷雾消失。
+	UploadSceneGpuVisionSources(/*bSceneFogActive=*/true);
 	const float UploadMs = static_cast<float>((FPlatformTime::Seconds() - UploadStartTime) * 1000.0);
 
 	if (bEnableSceneGpuVisionPerformanceStats)
@@ -555,7 +560,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	}
 }
 
-void AFogOfWar::UploadSceneGpuVisionSources()
+void AFogOfWar::UploadSceneGpuVisionSources(bool bSceneFogActive)
 {
 	if (!SceneFogViewExtension.IsValid())
 	{
@@ -618,7 +623,8 @@ void AFogOfWar::UploadSceneGpuVisionSources()
 	SceneFogViewExtension->UploadFrameData_GameThread(
 		SceneGpuVisionSources,
 		Settings,
-		ComputeSceneFogVisionField(FieldWorldMin, FieldWorldSize, VisionFieldTexelSizeCm));
+		ComputeSceneFogVisionField(FieldWorldMin, FieldWorldSize, VisionFieldTexelSizeCm),
+		bSceneFogActive);
 }
 
 int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& OutSourcesByTeam, int32 InTeamCount, int32* OutHighestTeamIndexSeen) const

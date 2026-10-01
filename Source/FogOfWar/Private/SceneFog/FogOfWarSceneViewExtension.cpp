@@ -247,7 +247,8 @@ FFogOfWarSceneViewExtension::FFogOfWarSceneViewExtension(const FAutoRegister& Au
 void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
 	TArray<FVector4f>& InOutSources,
 	const FFogOfWarSceneFogSettings& InSettings,
-	const FFogOfWarSceneVisionField& InField)
+	const FFogOfWarSceneVisionField& InField,
+	bool bInSceneFogActive)
 {
 	check(IsInGameThread());
 
@@ -258,6 +259,7 @@ void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
 	Swap(PendingSources, InOutSources);
 	PendingSettings = InSettings;
 	PendingField = InField;
+	PendingSceneFogActive = bInSceneFogActive;
 }
 
 void FFogOfWarSceneViewExtension::UploadExploredLayer_GameThread(const FFogOfWarSceneExploredLayer& InExploredLayer)
@@ -289,6 +291,7 @@ void FFogOfWarSceneViewExtension::SubscribeToPostProcessingPass(
 		RenderThreadSources = PendingSources;
 		RenderThreadSettings = PendingSettings;
 		RenderThreadField = PendingField;
+		RenderThreadSceneFogActive = PendingSceneFogActive;
 
 		// 已探索层只在内容真的变化时拷贝：它是逐格位图，比视野源大两三个数量级，
 		// 而探索层每秒只变几次。同一帧的第二个视口因为版本号已经对齐，同样会跳过。
@@ -298,8 +301,13 @@ void FFogOfWarSceneViewExtension::SubscribeToPostProcessingPass(
 		}
 	}
 
-	// 没有视野源、或场几何还没就绪（地图范围未知）就干脆不注入回调：连一次全屏 pass 都不产生。
-	if (RenderThreadSources.Num() == 0 || !RenderThreadField.IsValid())
+	// 不该遮蔽（雾系统关闭 / 子系统不可用）、或场几何还没就绪（地图范围未知）就干脆不注入回调：
+	// 连一次全屏 pass 都不产生。
+	//
+	// ⚠ 这里刻意**不**判断"有没有视野源"：本帧源为空（相机移出所有单位的视野范围、或视野源被视图
+	// 剔除干净）恰恰是"什么都看不见"的情形，必须跑一趟把整屏按"从未探索"遮蔽掉；早退会让迷雾
+	// 在画面里凭空消失。
+	if (!RenderThreadSceneFogActive || !RenderThreadField.IsValid())
 	{
 		return;
 	}
@@ -315,7 +323,8 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 	check(IsInRenderingThread());
 
 	// 兜底：理论上 SubscribeToPostProcessingPass 已经过滤过这两种情况。
-	if (RenderThreadSources.Num() == 0 || !RenderThreadField.IsValid())
+	// 同样刻意不判断"有没有视野源"：源为空时仍要走完三趟，把整屏按"从未探索"遮蔽掉。
+	if (!RenderThreadSceneFogActive || !RenderThreadField.IsValid())
 	{
 		return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
 	}
@@ -360,48 +369,6 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 
 	const int32 SourceCount = RenderThreadSources.Num();
 
-	// ---- 数据上传：视野源 + 每条源的场 AABB（纯算术，不含任何相机投影）----
-	FRDGBufferRef VisionSourceBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), SourceCount),
-		TEXT("FogOfWar.VisionSources"));
-	GraphBuilder.QueueBufferUpload(
-		VisionSourceBuffer,
-		RenderThreadSources.GetData(),
-		SourceCount * sizeof(FVector4f),
-		ERDGInitialDataFlags::None);
-
-	// AABB 是"圆心 ± 半径"换算出的纹素矩形，并在两轴分别 clamp 到场范围。
-	// 完全落在场外的源得到空矩形（min == max），散射 compute 里对应的循环体自然不执行。
-	TArray<FIntVector4> SourceAabbs;
-	SourceAabbs.SetNumUninitialized(SourceCount);
-	{
-		const float InvTexelSizeCm = 1.0f / Field.TexelSizeCm;
-		const float WorldMinX = static_cast<float>(Field.WorldMin.X);
-		const float WorldMinY = static_cast<float>(Field.WorldMin.Y);
-
-		for (int32 Index = 0; Index < SourceCount; ++Index)
-		{
-			const FVector4f& Source = RenderThreadSources[Index];
-			const float Radius = FMath::Max(Source.Z, 0.0f);
-
-			const int32 MinX = FMath::Clamp(FMath::FloorToInt((Source.X - Radius - WorldMinX) * InvTexelSizeCm), 0, FieldExtent.X);
-			const int32 MinY = FMath::Clamp(FMath::FloorToInt((Source.Y - Radius - WorldMinY) * InvTexelSizeCm), 0, FieldExtent.Y);
-			const int32 MaxX = FMath::Clamp(FMath::CeilToInt((Source.X + Radius - WorldMinX) * InvTexelSizeCm), 0, FieldExtent.X);
-			const int32 MaxY = FMath::Clamp(FMath::CeilToInt((Source.Y + Radius - WorldMinY) * InvTexelSizeCm), 0, FieldExtent.Y);
-
-			SourceAabbs[Index] = FIntVector4(MinX, MinY, MaxX, MaxY);
-		}
-	}
-
-	FRDGBufferRef AabbBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(sizeof(FIntVector4), SourceCount),
-		TEXT("FogOfWar.VisionSourceAabbs"));
-	GraphBuilder.QueueBufferUpload(
-		AabbBuffer,
-		SourceAabbs.GetData(),
-		SourceCount * sizeof(FIntVector4),
-		ERDGInitialDataFlags::None);
-
 	// ---- 趟 1：散射。每条视野源一个线程组，只扫自己的 AABB，整数原子取最大 ----
 	// R32_UINT：这是唯一能做 InterlockedMax 的场格式；8 位定标与最终 R8G8 的通道精度对齐。
 	FRDGTextureRef CoverageTexture = GraphBuilder.CreateTexture(
@@ -412,25 +379,73 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 
 	FRDGTextureUAVRef CoverageUAV = GraphBuilder.CreateUAV(CoverageTexture);
 	// 原子累加的起点必须是 0（未覆盖）。CreateTexture 的内容是未定义的，不能省这一步。
+	// 本帧一条视野源都没有时（SourceCount == 0），清零后的场就是最终结果：覆盖率全 0 —— 合成趟据此
+	// 把整屏判成"从未探索"，也就是**全遮蔽**。这正是"什么都看不见"应有的画面，因此下面把整个
+	// 上传 + 散射趟整体跳过（0 条源既没有 buffer 可建，也没有线程组可派发），而不是让雾消失。
 	AddClearUAVPass(GraphBuilder, CoverageUAV, 0u);
 
-	auto* SplatParameters = GraphBuilder.AllocParameters<FFogOfWarSceneVisionFieldSplatCS::FParameters>();
-	SplatParameters->VisionSources = GraphBuilder.CreateSRV(VisionSourceBuffer);
-	SplatParameters->VisionSourceAabbs = GraphBuilder.CreateSRV(AabbBuffer);
-	SplatParameters->VisionCoverage = CoverageUAV;
-	SplatParameters->FieldWorldMin = FieldWorldMin;
-	SplatParameters->FieldTexelSizeCm = Field.TexelSizeCm;
-	SplatParameters->SceneFogEdgeWidth = FMath::Max(RenderThreadSettings.EdgeWidthCm, 0.0f);
-	SplatParameters->VisionCoverageScale = VisionCoverageScale;
+	if (SourceCount > 0)
+	{
+		// ---- 数据上传：视野源 + 每条源的场 AABB（纯算术，不含任何相机投影）----
+		FRDGBufferRef VisionSourceBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), SourceCount),
+			TEXT("FogOfWar.VisionSources"));
+		GraphBuilder.QueueBufferUpload(
+			VisionSourceBuffer,
+			RenderThreadSources.GetData(),
+			SourceCount * sizeof(FVector4f),
+			ERDGInitialDataFlags::None);
 
-	// GroupCount 的 Z 维就是源数：一个线程组 = 一条视野源。组内 8×8 的线程按步长扫过该源的 AABB，
-	// 因此派发出来的线程全部落在"这条源真正可能覆盖的纹素"上，没有全屏 × 全源的乘积项。
-	FComputeShaderUtils::AddPass(
-		GraphBuilder,
-		RDG_EVENT_NAME("FogOfWar.VisionFieldSplat(%d)", SourceCount),
-		SplatShader,
-		SplatParameters,
-		FIntVector(1, 1, SourceCount));
+		// AABB 是"圆心 ± 半径"换算出的纹素矩形，并在两轴分别 clamp 到场范围。
+		// 完全落在场外的源得到空矩形（min == max），散射 compute 里对应的循环体自然不执行。
+		TArray<FIntVector4> SourceAabbs;
+		SourceAabbs.SetNumUninitialized(SourceCount);
+		{
+			const float InvTexelSizeCm = 1.0f / Field.TexelSizeCm;
+			const float WorldMinX = static_cast<float>(Field.WorldMin.X);
+			const float WorldMinY = static_cast<float>(Field.WorldMin.Y);
+
+			for (int32 Index = 0; Index < SourceCount; ++Index)
+			{
+				const FVector4f& Source = RenderThreadSources[Index];
+				const float Radius = FMath::Max(Source.Z, 0.0f);
+
+				const int32 MinX = FMath::Clamp(FMath::FloorToInt((Source.X - Radius - WorldMinX) * InvTexelSizeCm), 0, FieldExtent.X);
+				const int32 MinY = FMath::Clamp(FMath::FloorToInt((Source.Y - Radius - WorldMinY) * InvTexelSizeCm), 0, FieldExtent.Y);
+				const int32 MaxX = FMath::Clamp(FMath::CeilToInt((Source.X + Radius - WorldMinX) * InvTexelSizeCm), 0, FieldExtent.X);
+				const int32 MaxY = FMath::Clamp(FMath::CeilToInt((Source.Y + Radius - WorldMinY) * InvTexelSizeCm), 0, FieldExtent.Y);
+
+				SourceAabbs[Index] = FIntVector4(MinX, MinY, MaxX, MaxY);
+			}
+		}
+
+		FRDGBufferRef AabbBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FIntVector4), SourceCount),
+			TEXT("FogOfWar.VisionSourceAabbs"));
+		GraphBuilder.QueueBufferUpload(
+			AabbBuffer,
+			SourceAabbs.GetData(),
+			SourceCount * sizeof(FIntVector4),
+			ERDGInitialDataFlags::None);
+
+		auto* SplatParameters = GraphBuilder.AllocParameters<FFogOfWarSceneVisionFieldSplatCS::FParameters>();
+		SplatParameters->VisionSources = GraphBuilder.CreateSRV(VisionSourceBuffer);
+		SplatParameters->VisionSourceAabbs = GraphBuilder.CreateSRV(AabbBuffer);
+		SplatParameters->VisionCoverage = CoverageUAV;
+		SplatParameters->FieldWorldMin = FieldWorldMin;
+		SplatParameters->FieldTexelSizeCm = Field.TexelSizeCm;
+		SplatParameters->SceneFogEdgeWidth = FMath::Max(RenderThreadSettings.EdgeWidthCm, 0.0f);
+		SplatParameters->VisionCoverageScale = VisionCoverageScale;
+
+		// GroupCount 的 Z 维就是源数：一个线程组 = 一条视野源。组内 8×8 的线程按步长扫过该源的 AABB，
+		// 因此派发出来的线程全部落在"这条源真正可能覆盖的纹素"上，没有全屏 × 全源的乘积项。
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("FogOfWar.VisionFieldSplat(%d)", SourceCount),
+			SplatShader,
+			SplatParameters,
+			FIntVector(1, 1, SourceCount));
+	}
 
 	// ---- 历史已探索层：保持位打包，只有几 KB ----
 	// 位序与 FRlSpatialMap::ExploredBitmap 一致，所以从不展开；没有提供者时给一个 0 元素的兜底，

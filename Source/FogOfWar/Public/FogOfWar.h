@@ -115,7 +115,9 @@ public:
 	UPROPERTY(EditAnywhere, meta = (ClampMin = 0.0f, UIMin = 0.0f, ClampMax = 1.0f, UIMax = 1.0f))
 	float SceneFogOpacity = 0.5f;
 
-	/// @brief 场景雾的 GPU 揭雾源总开关。关闭时本帧交出空清单，渲染侧连 pass 都不注入（雾消失）。
+	/// @brief 场景雾的 GPU 揭雾源总开关。关闭时本帧告诉渲染侧“不遮蔽”，连 pass 都不注入（雾消失）。
+	/// @note 与之相对：开关开着、但本帧一条视野源都没有时，画面是**整屏遮蔽**（什么都看不见），
+	///       而不是雾消失 —— 这两件事在渲染侧由独立的标志区分，见 UploadSceneGpuVisionSources 的说明。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
 	bool bEnableSceneGpuVisionSources = true;
 
@@ -175,6 +177,8 @@ public:
 	///          判定所需的相机信息不可用时自动整体放弃剔除（宁可多留源，也绝不误剔）。
 	/// @note 剔除只影响“当前这一帧画什么”，不影响历史已探索层 —— 后者由外部系统用不剔除的
 	///       CollectVisionSourcesByTeam 累积，因此屏幕被移出视野的单位仍然会被记进探索层。
+	/// @note 相机移出所有单位的视野范围时，本帧的源会被清空，此时画面整屏被迷雾遮蔽 ——
+	///       这是“什么都看不见”的正确表现，不是异常。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
 	bool bCullVisionSourcesOutOfView = true;
 
@@ -302,8 +306,13 @@ public:
 	 * @details 场几何优先取外部探索层给的地图范围（它与逐格探索层必须同矩形，否则灰雾会整体错位），
 	 *          拿不到时才退回本 Actor 的 GridBottomLeftWorldLocation + GridSize。已探索层同样在这里
 	 *          刷新：它每秒只变几次，靠提供者给出的版本号判断要不要重新取。
+	 * @param bSceneFogActive 本帧是否应该用雾遮蔽画面。**它不等于"有没有视野源"**：
+	 *          - false（雾开关关闭 / 子系统不可用）→ 渲染侧不注入 pass，画面完全不受遮蔽；
+	 *          - true 且本帧一条源都没有（相机移出所有单位的视野范围、或源被视图剔除干净）
+	 *            → 渲染侧照常注入 pass，覆盖率场全 0，整屏按"从未探索"遮蔽 —— 这才是"什么
+	 *            都看不见"应有的画面，而不是让迷雾凭空消失。
 	 */
-	void UploadSceneGpuVisionSources();
+	void UploadSceneGpuVisionSources(bool bSceneFogActive);
 
 	int32 SceneGpuVisionPerfSampleCount = 0;
 	double SceneGpuVisionPerfLastFlushTime = 0.0;

@@ -98,7 +98,7 @@ float4 FarWorld4  = mul(float4(NDC, 0.5, 1.0), InvViewProjection);
 
 ```text
 bAutoActivate                              是否 BeginPlay 自动激活
-bEnableSceneGpuVisionSources               总开关；关闭时交出空清单，渲染侧连 pass 都不注入
+bEnableSceneGpuVisionSources               总开关；关闭时渲染侧连 pass 都不注入（画面无遮蔽，而非全遮蔽）
 MaxSceneGpuVisionSources                   每帧最多交给 GPU 的视野源数（超出按遍历顺序截断）
 SceneGpuVisionSourceRadiusPadding          每条源的额外半径余量（同时覆盖投影平面高度差，不建议设 0）
 FogEdgeWidth                               视野圆边缘软化宽度；0 = 硬边
@@ -149,7 +149,7 @@ FFogOfWarExploredLayerProvider::Set(FFogOfWarGetExploredLayerDelegate::CreateUOb
 ## 线程模型
 
 - **游戏线程**：`UpdateSceneGpuVisionSources()` 收集清单 → 刷新已探索层 → `UploadFrameData_GameThread()` 加锁交换清单与参数快照、`UploadExploredLayer_GameThread()` 单独交已探索层（它的数据量比视野源大两三个数量级，不值得每帧搬）。游戏线程不碰任何图形资源。
-- **渲染线程**：`SubscribeToPostProcessingPass()` 取一份快照（多视口时同一帧会多次 Subscribe，因此是拷贝而不是交换），没有源或场几何未就绪就不注入回调；回调里按 RDG 建缓冲与纹理并记录三趟 pass。RDG 的 `QueueBufferUpload` 会自己拷贝源数据，因此不存在跨帧生命周期问题。
+- **渲染线程**：`SubscribeToPostProcessingPass()` 取一份快照（多视口时同一帧会多次 Subscribe，因此是拷贝而不是交换），只有“本帧不该遮蔽”（雾总开关关闭 / 子系统不可用）或场几何未就绪时才不注入回调；回调里按 RDG 建缓冲与纹理并记录三趟 pass —— 本帧没有视野源时跳过上传与散射趟、只保留清零后的覆盖率场，于是整屏被判成“从未探索”而被遮蔽。RDG 的 `QueueBufferUpload` 会自己拷贝源数据，因此不存在跨帧生命周期问题。
 
 ## 已知取舍
 
