@@ -115,6 +115,73 @@ namespace
 	}
 
 	/**
+	 * 视野扇形解析（全插件唯一实现）：给出该 Agent 的揭雾扇形中轴与半角余弦。
+	 *
+	 * 返回 true = 需要按扇形裁剪（张角 ∈ (0, 360) 且能定位朝向）；false = 全向。
+	 * 调用方在 false 时写"全向哨兵"（HalfAngleCos >= 1），下游据此整段跳过方向判定，
+	 * 行为与旧的圆形揭雾逐字一致。
+	 *
+	 * 三个"退化即全向"的分支，理由各不相同：
+	 *  ① 没有视野碎片 → 该实体根本不是视野源，由半径侧的同一个函数统一否掉，这里只管形状；
+	 *  ② 张角 >= 360（或 <= 0）→ 张角语义上就是"全向"，不是缺失；
+	 *  ③ 张角是扇形、但拿不到 FRotating（或方向为零）→ **宁可多揭也不要漏揭**：朝向缺失时
+	 *     按全向处理，最坏是"雾少遮了一块"，而按 +X 处理会让单位的视野整块转到错误方向 ——
+	 *     前者是保守的视觉误差，后者是把可见区域指错，代价不对等。
+	 *
+	 * 为什么朝向在这里现取、不缓存进 fragment：朝向每帧都在变（FRotating 由移动/朝向处理器写），
+	 * 缓存进碎片等于引入一份注定过期的影子真值。张角则相反 —— 它来自索敌配置，由
+	 * UMassBattleFogOfWarBootstrapProcessor 一次性写进 FMassVisionFragment::SightAngleDegrees。
+	 *
+	 * @param InVisionFragment 调用方已经取到的视野碎片（**不在这里重复取**：两条收集链都在
+	 *                         每 Agent 的热路径上，多一次 GetFragmentDataPtr 就是一次多余的
+	 *                         实体→块解析；传 nullptr 表示"没有视野碎片"，直接判全向）。
+	 * @param OutForwardDir    扇形中轴（世界 XY 单位向量）；仅在返回 true 时有效。
+	 * @param OutHalfAngleCos  cos(张角 / 2)；仅在返回 true 时有效。
+	 */
+	bool TryGetVisionSector(
+		const FMassVisionFragment* InVisionFragment,
+		const FMassEntityManager& InEntityManager,
+		const FMassEntityHandle InEntity,
+		FVector2D& OutForwardDir,
+		float& OutHalfAngleCos)
+	{
+		if (!InVisionFragment
+			|| !(InVisionFragment->SightAngleDegrees > 0.0f)
+			|| InVisionFragment->SightAngleDegrees >= 360.0f)
+		{
+			return false;
+		}
+
+		// 朝向：必须**真的拿到**才敢按扇形裁剪（见上面 ③）。
+		// 拿不到朝向（没有 FOW_ROTATION_FRAGMENT，或方向是零向量）时返回 false 退化成全向 ——
+		// 不能"填一个默认 +X 再返回 true"：下游（GPU 着色器 / CPU 逐格内核）看到 cosHalfAngle < 1
+		// 就会照做扇形裁剪，方向错 = 结果错，而且没有任何日志会提示。
+		FVector2D Forward = FVector2D::ZeroVector;
+		bool bHasForward = false;
+#if FOW_HAS_MASSBATTLE_ROTATION
+		if (const FOW_ROTATION_FRAGMENT* Rotation = InEntityManager.GetFragmentDataPtr<FOW_ROTATION_FRAGMENT>(InEntity))
+		{
+			const FVector RotationDir = FVector(FOW_GET_ROTATION_DIRECTION(*Rotation));
+			if (RotationDir.SizeSquared2D() > KINDA_SMALL_NUMBER)
+			{
+				const FVector Normalized = RotationDir.GetSafeNormal2D();
+				Forward = FVector2D(Normalized.X, Normalized.Y);
+				bHasForward = true;
+			}
+		}
+#endif
+
+		if (!bHasForward)
+		{
+			return false;
+		}
+
+		OutForwardDir = Forward;
+		OutHalfAngleCos = FMath::Cos(FMath::DegreesToRadians(InVisionFragment->SightAngleDegrees * 0.5f));
+		return true;
+	}
+
+	/**
 	 * 视野源判定（全插件唯一实现）：该 Agent 是否为指定队伍的视野源，并给出生效揭雾半径。
 	 * GPU 揭雾收集（UpdateSceneGpuVisionSources）与 CPU 侧逐队收集（CollectVisionSourcesByTeam）
 	 * 都调用这里，保证"谁能看见"的规则只有一份，不会在两条链路之间漂移。
@@ -128,6 +195,11 @@ namespace
 	 * @param OutSightRadiusCm  可选输出：未加余量的原始视距（= FMassVisionFragment::SightRadius）。
 	 *                          给需要"当前可见性判定"的消费者用：可见性必须按真实视距算，
 	 *                          含渲染余量的半径只适合描述"被揭开的画面范围"。
+	 * @param OutForwardDir     可选输出：扇形中轴（世界 XY 单位向量）。
+	 * @param OutHalfAngleCos   可选输出：cos(张角 / 2)；**>= 1 表示全向**（哨兵值，见 FFogVisionSource）。
+	 *                          两个扇形输出必须**成对请求**：只有请求了才多读一次朝向碎片 ——
+	 *                          渲染热路径在不需要扇形时（例如将来某条只关心半径的消费者）
+	 *                          不会为此付出朝向查询的代价。
 	 * @return 是否为有效视野源。
 	 */
 	bool TryGetVisionSourceRadius(
@@ -137,7 +209,9 @@ namespace
 		float InRadiusPaddingCm,
 		float& OutRadiusCm,
 		int32* OutTeamIndex = nullptr,
-		float* OutSightRadiusCm = nullptr)
+		float* OutSightRadiusCm = nullptr,
+		FVector2D* OutForwardDir = nullptr,
+		float* OutHalfAngleCos = nullptr)
 	{
 		if (!InEntityManager.IsEntityValid(InAgentData.EntityHandle))
 		{
@@ -175,6 +249,25 @@ namespace
 		if (OutSightRadiusCm)
 		{
 			*OutSightRadiusCm = VisionFragment->SightRadius;
+		}
+
+		// ④ 揭雾形状（扇形 / 全向）—— 与半径同源同一碎片，解析逻辑见 TryGetVisionSector。
+		//    哨兵约定：非扇形（含没有视野碎片、张角 >= 360）写 cosHalfAngle = 2（> 1），
+		//    消费方据此整段跳过方向判定；朝向字段写成 +X 只是为了有个确定值，全向时它不被读。
+		if (OutForwardDir || OutHalfAngleCos)
+		{
+			FVector2D ForwardDir(1.0, 0.0);
+			float HalfAngleCos = 2.0f;
+			TryGetVisionSector(VisionFragment, InEntityManager, InAgentData.EntityHandle, ForwardDir, HalfAngleCos);
+
+			if (OutForwardDir)
+			{
+				*OutForwardDir = ForwardDir;
+			}
+			if (OutHalfAngleCos)
+			{
+				*OutHalfAngleCos = HalfAngleCos;
+			}
 		}
 		return true;
 	}
@@ -453,12 +546,20 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 			// 与 CPU 侧逐队收集共用同一份规则；这里只负责"筛选 + 写进 GPU 缓冲 + 计数"。
 			// 观察队伍不可用（INDEX_NONE）时退化为不按队伍过滤（全场并集），避免整屏变黑。
 			float UploadRadius = 0.0f;
+			// 扇形参数与半径在同一次判定里取回：朝向碎片的读取与"要不要读"的决策都收在
+			// TryGetVisionSourceRadius 内部，这里不再单独查一次碎片（见该函数的参数说明）。
+			FVector2D SectorForward(1.0, 0.0);
+			float SectorHalfAngleCos = 2.0f;
 			if (!TryGetVisionSourceRadius(
 				EntityManager,
 				AgentData,
 				bFilterVisionSourcesByTeam ? ViewingTeamIndex : INDEX_NONE,
 				SceneGpuVisionSourceRadiusPadding,
-				UploadRadius))
+				UploadRadius,
+				/*OutTeamIndex=*/nullptr,
+				/*OutSightRadiusCm=*/nullptr,
+				&SectorForward,
+				&SectorHalfAngleCos))
 			{
 				continue;
 			}
@@ -477,32 +578,15 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 
 			const FVector4f Candidate(static_cast<float>(WorldLocation.X), static_cast<float>(WorldLocation.Y), UploadRadius, 0.0f);
 
-			// 扇形参数：张角来自视野碎片（Bootstrap 从索敌 Common::TraceAngle 写入），朝向取单位
-			// 自身 —— 朝向每帧都变，所以不缓存进碎片，在这里现取。张角 >= 360（或 <= 0）、拿不到
-			// 朝向时写全向哨兵（cosHalfAngle = 2 > 1），着色器据此跳过扇形判定，行为与旧的圆形
-			// 揭雾完全一致。
-			FVector4f CandidateDir(0.0f, 0.0f, 2.0f, 0.0f);
-			if (const FMassVisionFragment* VisionForDir = EntityManager.GetFragmentDataPtr<FMassVisionFragment>(AgentData.EntityHandle))
-			{
-				if (VisionForDir->SightAngleDegrees > 0.0f && VisionForDir->SightAngleDegrees < 360.0f)
-				{
-					FVector Forward = FVector::ForwardVector;
-#if FOW_HAS_MASSBATTLE_ROTATION
-					if (const FOW_ROTATION_FRAGMENT* Rotation = EntityManager.GetFragmentDataPtr<FOW_ROTATION_FRAGMENT>(AgentData.EntityHandle))
-					{
-						const FVector RotationDir = FVector(FOW_GET_ROTATION_DIRECTION(*Rotation));
-						if (RotationDir.SizeSquared2D() > KINDA_SMALL_NUMBER)
-						{
-							Forward = RotationDir.GetSafeNormal2D();
-						}
-					}
-#endif
-					const float HalfAngleRad = FMath::DegreesToRadians(VisionForDir->SightAngleDegrees * 0.5f);
-					CandidateDir = FVector4f(
-						static_cast<float>(Forward.X), static_cast<float>(Forward.Y),
-						FMath::Cos(HalfAngleRad), 0.0f);
-				}
-			}
+			// 扇形参数：张角与朝向由 TryGetVisionSourceRadius → TryGetVisionSector 一并解析
+			// （与 CPU 侧探索层共用同一份"揭雾形状"实现，两条链路不会各判一套）。
+			// 哨兵约定：HalfAngleCos >= 1 = 全向（张角 >= 360 / <= 0），写 (0, 0, 2) ——
+			// 着色器看到 Dir.z >= 1 就整段跳过方向判定，行为与旧的圆形揭雾完全一致。
+			const FVector4f CandidateDir = (SectorHalfAngleCos < 1.0f)
+				? FVector4f(
+					static_cast<float>(SectorForward.X), static_cast<float>(SectorForward.Y),
+					SectorHalfAngleCos, 0.0f)
+				: FVector4f(0.0f, 0.0f, 2.0f, 0.0f);
 
 			// 圆盘包含剔除（判据见 IsDiscContainedIn，集合等价、零画面误差）：
 			// ① 本格已收下的某个候选包含本候选 → 本候选整条丢掉；
@@ -717,6 +801,8 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 				int32 AgentTeamIndex = INDEX_NONE;
 				float RadiusCm = 0.0f;
 				float SightRadiusCm = 0.0f;
+				FVector2D SectorForward(1.0, 0.0);
+				float SectorHalfAngleCos = 2.0f;
 				if (!TryGetVisionSourceRadius(
 					EntityManager,
 					AgentData,
@@ -724,7 +810,9 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 					SceneGpuVisionSourceRadiusPadding,
 					RadiusCm,
 					&AgentTeamIndex,
-					&SightRadiusCm))
+					&SightRadiusCm,
+					&SectorForward,
+					&SectorHalfAngleCos))
 				{
 					continue;
 				}
@@ -754,6 +842,10 @@ int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& Ou
 				Out.WorldLocation = FVector2D(WorldLocation.X, WorldLocation.Y);
 				Out.RadiusCm = RadiusCm;
 				Out.SightRadiusCm = SightRadiusCm;
+				// 揭雾形状随源一起交给 CPU 消费者（探索层 / 可见层都要按同一形状裁剪，
+				// 否则画面上看不见的地方会被 CPU 侧标成"已探索 / 可见"）。
+				Out.ForwardDir = SectorForward;
+				Out.HalfAngleCos = SectorHalfAngleCos;
 				++TotalSources;
 			}
 		}

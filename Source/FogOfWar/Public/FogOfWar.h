@@ -17,11 +17,15 @@ class FFogOfWarSceneViewExtension;
 
 /**
  * @struct FFogVisionSource
- * @brief CPU 侧一条视野源：揭雾中心（世界 XY）+ 生效半径（cm）。
+ * @brief CPU 侧一条视野源：揭雾中心（世界 XY）+ 生效半径（cm）+ 揭雾扇形（方向 + 半角余弦）。
  * @details 与交给场景雾渲染的是同一批数据：已按观察队伍过滤，且半径已叠加
  *          AFogOfWar::SceneGpuVisionSourceRadiusPadding（即实际被揭开的范围）。
  *          供同工程的 CPU 消费者（如地图的"已探索"层）复用同一条收集链，
  *          避免各自复刻"谁能看见"的规则而产生分叉。
+ *
+ *          形状（圆 / 扇形）同样来自这条链、同样与 GPU 一致：**CPU 侧必须按扇形裁剪**，
+ *          否则"屏幕上看不见的地方，小地图/探索层却标成已探索"，两套视野说法互相打架。
+ *          见 HalfAngleCos 的哨兵约定。
  */
 struct FOGOFWAR_API FFogVisionSource
 {
@@ -39,6 +43,17 @@ struct FOGOFWAR_API FFogVisionSource
 	///            （如地图的当前可见层 → RL 观测的 bVisible）必须用本字段 —— 余量是给抖动/投影留的
 	///            缓冲（默认 300cm），拿它做可见性判定等于凭空放大视野，让"看不见的敌人"被标成可见。
 	float SightRadiusCm = 0.0f;
+
+	/// @brief 揭雾扇形的中轴方向（世界 XY 单位向量）。仅当 HalfAngleCos < 1 时有意义。
+	FVector2D ForwardDir = FVector2D(1.0f, 0.0f);
+
+	/// @brief 揭雾扇形半角的余弦 = cos(张角 / 2)；**>= 1 = 全向**（哨兵，默认值即此）。
+	/// @details 判据与 GPU 着色器、以及 CPU 逐格内核完全一致：落在扇形外的格/纹素**完全不揭雾**
+	///          （硬边，只在半径方向软化）。消费方看到 >= 1 必须**整段跳过**方向判定 ——
+	///          这是"张角 >= 360 / <= 0 / 拿不到朝向"三种情况的统一表达，跳过后行为与旧的圆形揭雾逐字一致。
+	///          存余弦而不是角度：两侧的判定都在逐格/逐纹素的最内层循环里（地图探索层是千万格量级），
+	///          每格一次 acos 是纯粹的浪费；一次开方 + 一次点积就够。角度只在需要人来读日志时才算。
+	float HalfAngleCos = 1.0f;
 };
 
 /// 声明一个全局的日志分类，用于本模块的日志输出
@@ -49,9 +64,11 @@ DECLARE_LOG_CATEGORY_EXTERN(LogFogOfWar, Log, All)
  * @brief 战争迷雾系统的核心管理器Actor。
  * @details 场景战争迷雾的 GPU 路径：CPU 从 MassBattle HashGrid 收集带 FMassVisionFragment 的
  * Agent 视野源（全图遍历、按观察队伍过滤、视图剔除 + 圆盘包含剔除，受 MaxSceneGpuVisionSources
- * 上限约束），把 (WorldX, WorldY, SightRadius + SceneGpuVisionSourceRadiusPadding) 连同视野场几何
- * 交给 FFogOfWarSceneViewExtension，由它在 Tonemap 之后散射成世界空间视野场再合成（详见该类的说明）。
- * 同一批视野源也按队伍暴露给 CPU 侧消费者（CollectVisionSourcesByTeam，供探索层等逻辑累积历史）。
+ * 上限约束），把 (WorldX, WorldY, SightRadius + SceneGpuVisionSourceRadiusPadding) 连同**揭雾形状**
+ * （全向 / 扇形：中轴 + 半角余弦）以及视野场几何交给 FFogOfWarSceneViewExtension，
+ * 由它在 Tonemap 之后散射成世界空间视野场再合成（详见该类的说明）。
+ * 同一批视野源也按队伍暴露给 CPU 侧消费者（CollectVisionSourcesByTeam，供探索层等逻辑累积历史），
+ * 且**形状一并带过去** —— 屏幕上的雾与 CPU 侧的探索层必须是同一个形状，否则两套"能不能看见"互相打架。
  *
  * @details “历史已探索”不由本类持有：本插件只维护当前帧可见性，历史由外部权威系统累积
  *          （本工程里是 UMassBattleMapSubsystem 的逐队探索层），经 FFogOfWarExploredLayerProvider
@@ -148,9 +165,12 @@ public:
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float SceneGpuVisionSourceRadiusPadding = 300.0f;
 
-	/// @brief 视野圆边缘的软化宽度（cm）。0 = 硬边。
-	/// @details 覆盖率 = 1 - smoothstep(Radius - FogEdgeWidth, Radius, Distance)，圆内 1、圆外 0。
+	/// @brief 视野边缘的软化宽度（cm）。0 = 硬边。
+	/// @details 覆盖率 = 1 - smoothstep(Radius - FogEdgeWidth, Radius, Distance)，范围内 1、外 0。
 	///          每帧随参数快照交给渲染线程，因此在 PIE 里实时可调。
+	/// @note 本参数只软化**半径方向**的边界。扇形源的两条直边（张角边界）是硬边、不受它影响 ——
+	///       直边的软化需要在角度域上做一次 smoothstep，而扇形在 Mass 单位上本就是"索敌范围的近似表达"，
+	///       多这一档软化只是把边界挪几度，收益远小于它引入的额外分支。硬边与索敌的判定边界因此完全重合。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU", meta = (ClampMin = "0.0", UIMin = "0.0", Units = "cm"))
 	float FogEdgeWidth = 0.0f;
 
@@ -255,8 +275,10 @@ public:
 	/**
 	 * @brief       按队伍收集 CPU 侧视野源（一次遍历分桶）。
 	 * @details     与 UpdateSceneGpuVisionSources() 走同一套规则（唯一实现见 .cpp 内的
-	 *              TryGetVisionSourceRadius）：FMassVisionFragment::SightRadius 必须为正，
-	 *              生效半径 = SightRadius + SceneGpuVisionSourceRadiusPadding，并按 FTeam::index 归队。
+	 *              TryGetVisionSourceRadius / TryGetVisionSector）：FMassVisionFragment::SightRadius 必须为正，
+	 *              生效半径 = SightRadius + SceneGpuVisionSourceRadiusPadding，并按 FTeam::index 归队；
+	 *              揭雾形状（圆 / 扇形）也一并给出（FMassVisionFragment::SightAngleDegrees 与
+	 *              FRotating::Direction），因此 CPU 消费者不需要自己再判一次扇形。
 	 *              与 GPU 侧只有两点不同：① 不按"当前观察队伍"过滤，而是每个队伍各一份；
 	 *              ② 不受 bEnableSceneGpuVisionSources 开关影响（那是渲染开关，而探索累积属于
 	 *              逻辑/观测需求）。每队的收集上限是 MaxCpuVisionSourcesPerTeam（默认 0 = 不限，

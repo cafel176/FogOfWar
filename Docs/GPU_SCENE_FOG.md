@@ -1,13 +1,19 @@
-# GPU 圆形场景战争迷雾（世界空间视野场 + 记录层）
+# GPU 场景战争迷雾（世界空间视野场 + 记录层）
 
-场景战争迷雾由**三趟 RDG pass** 实现，不使用后处理材质，也不用屏幕空间的几何散射：
+场景战争迷雾由**三趟 RDG pass** 实现，不使用后处理材质，也不用屏幕空间的几何散射。
+
+视野形状由每个单位自己的索敌配置决定：**张角 360° 是圆盘，小于 360° 是以单位朝向（`FRotating::Direction`）为中轴的扇形**。
+关键在于 GPU（画面）与 CPU（已探索层 / 当前可见层）用的是**同一份形状解析与同一个裁剪判据** ——
+形状的解析只有一处实现（`FogOfWar.cpp` 的 `TryGetVisionSector`）：
+两条收集链都从它取“中轴 + cos(张角 / 2)”，因此不存在“屏幕上被雾遮住、小地图却标成已探索”这类两套视野互相打架的情况。
 
 | 组件 | 位置 | 职责 |
 | --- | --- | --- |
-| `AFogOfWar` | `Source/FogOfWar/Private/FogOfWar.cpp` | 收集视野源（HashGrid + 队伍过滤 + 两道剔除），算场几何，取已探索层，把三者交给渲染线程 |
+| `AFogOfWar` | `Source/FogOfWar/Private/FogOfWar.cpp` | 收集视野源（HashGrid + 队伍过滤 + 两道剔除），解析揭雾形状，算场几何，取已探索层，把三者交给渲染线程 |
 | `FFogOfWarSceneViewExtension` | `Source/FogOfWar/Private/SceneFog/` | 世界作用域的 SceneViewExtension，在 Tonemap 之后插入三趟 pass |
 | `FogOfWarScene.usf` | `Shaders/Private/FogOfWarScene.usf` | `VisionFieldSplatCS`（散射）+ `VisionFieldPackPS`（打包 R8G8）+ `CompositeVS/PS`（合成） |
 | `FFogOfWarExploredLayerProvider` | `Source/FogOfWar/Public/` | “历史已探索层”的注册点；本工程里由 `UMassBattleMapSubsystem` 注册 |
+| `UMassBattleMapSubsystem::RasterizeVisionShapes` | `Plugins/MassBattleAgent/Source/MassBattleMap/Private/MassBattleMapSubsystem.cpp` | CPU 侧的同一套视野形状：逐格落盘“已探索层 + 当前可见层” |
 
 ## 为什么不是后处理材质
 
@@ -49,6 +55,24 @@ Coverage = 1 - smoothstep(Radius - EdgeWidth, Radius, Distance)   // EdgeWidth =
 ```
 
 写进 `PF_R32_UINT` 场（`InterlockedMax` 只能在整数格式上做）。命中 AABB 之外或覆盖率 ≤ 0 的纹素直接跳过，不产生任何写入。
+
+**扇形裁剪**发生在同一趟、同一条纹素的半径判定之前：
+
+```hlsl
+// Dir.z 是 cos(半角)。>= 1 表示全向（CPU 对张角 >= 360 的源写 2.0），整段跳过 —— 圆形揭雾的老行为一字不改。
+const float4 Dir = VisionSourceDirs[SourceIndex];
+if (Dir.z < 1.0 && Distance > 1e-4)
+{
+    if (dot(ToTexel / Distance, Dir.xy) < Dir.z) continue;   // 落在扇形外：完全不揭雾（硬边）
+}
+```
+
+几个容易踩的点：
+
+- **判据是“纹素相对源中心的方向”**，与 CPU 侧逐格内核用的是同一个式子（两边各自做一次 `dot >= cosHalfAngle`，不共享数学但共享定义）。
+- **`Distance > 1e-4` 的守卫不是可选项**：`ToTexel` 在源所在纹素上近似为零向量，归一化会出 NaN，而 NaN 参与比较恒为 false —— 后果是**源自己脚下那个纹素反而不揭雾**。CPU 侧对应的是“距离平方 ≈ 0 时直接算命中”。
+- **扇形边界是硬边**：`SceneFogEdgeWidth` 只软化半径方向。两条直边做软化需要在角度域再插一档 `smoothstep`，而扇形在 Mass 单位上本就是索敌范围的近似表达，多这一档只是把边界挪几度；不软化反而让“画面上的雾边界”与“索敌的判定边界”完全重合，排查问题时少一个变量。
+- **AABB 仍是圆的外接矩形**：扇形裁剪只在逐纹素做，这一趟的 AABB 不随张角收紧（GPU 侧每次只扫一条源，多出来的纹素被 `continue` 掉即可）。CPU 侧不一样 —— 那里每次刷新的遍历量与“每条源的框”成正比、且要覆盖全图，所以它在预处理阶段就按扇形外接框把框收紧了，见下文。
 
 ### 趟 2 `FogOfWar.VisionFieldPack`
 
@@ -114,18 +138,53 @@ SceneGpuVisionPerformanceLogInterval       统计周期（秒）
 
 这些参数每帧随视野源一起作为一份快照交给渲染线程，因此**在 PIE 里改动能立刻生效**。
 
+**揭雾形状不在这张表里** —— 它是逐单位的数据，不是全局开关，来源只有一条链：
+
+```text
+FTrace::Mode == SectorTraceByTraits
+  → FTrace::SectorTrace::Common::TraceRadius / TraceAngle      （半径与张角取自同一组参数，不会错配）
+  → UMassBattleFogOfWarBootstrapProcessor 写入 FMassVisionFragment::SightRadius / SightAngleDegrees
+  → 收集时现读 FRotating::Direction 作为中轴                     （朝向每帧变，不缓存）
+  → cos(张角 / 2) ≥ 1 ? 全向 : 扇形
+```
+
+手工配置的单位（`UMassVisionTrait`）直接写 `FMassVisionFragment::SightAngleDegrees` 即可，默认 360 = 全向。
+想看某个单位的实际形状，读 `CollectVisionSourcesByTeam()` 的结果里的 `HalfAngleCos`：`>= 1` 就是全向，
+否则 `acos(HalfAngleCos) * 2` 是它的张角（度）。
+
 ## CPU 侧收集
 
-每帧 Tick 走一趟（唯一实现：`FogOfWar.cpp` 内的 `TryGetVisionSourceRadius` / `IsDiscContainedIn`）：
+每帧 Tick 走一趟（唯一实现：`FogOfWar.cpp` 内的 `TryGetVisionSourceRadius` / `TryGetVisionSector` / `IsDiscContainedIn`）：
 
 1. 遍历 `UMassBattleHashGridSubsystem::AgentGrid` 的每个 block / cell / agent；
 2. 只要带 `FMassVisionFragment` 且 `SightRadius > 0` 的 Agent，生效半径 = `SightRadius + SceneGpuVisionSourceRadiusPadding`；
 3. 按“观察队伍提供者”（`FFogOfWarViewingTeamProvider`）过滤，提供者缺失时退化为全场并集；
-4. **视图剔除**：完全落在当前视口之外的源不可能覆盖任何输出像素（集合等价，非近似）；
-5. **圆盘包含剔除**：源 A 的圆盘完全落在源 B 的圆盘内（`dist + rA <= rB`）时删掉 A 严格无影响（场取覆盖率最大值）。搜索范围限于同一个 HashGrid 格，因此是“可靠的但未必穷尽”；
-6. 受 `MaxSceneGpuVisionSources` 截断后交给渲染线程。
+4. **揭雾形状**：张角来自 `FMassVisionFragment::SightAngleDegrees`（Bootstrap 从索敌 `Common::TraceAngle` 写入），朝向**当场**读 `FRotating::Direction`（朝向每帧都变，缓存进碎片等于留一份注定过期的影子真值）。两者一起压成“中轴 + cos(张角/2)”，`cos >= 1` 是全向哨兵；
+5. **视图剔除**：完全落在当前视口之外的源不可能覆盖任何输出像素（集合等价，非近似）；
+6. **圆盘包含剔除**：源 A 的圆盘完全落在源 B 的圆盘内（`dist + rA <= rB`）时删掉 A 严格无影响（场取覆盖率最大值）。搜索范围限于同一个 HashGrid 格，因此是“可靠的但未必穷尽”。⚠ 对扇形源这是**保守**的（圆 ⊇ 扇形，被删的源的扇形一定仍被保留下来的圆盖住），但方向必须跟着一起删 —— 所以 `CellDirs` 与 `CellSources` 同索引增删，漏一个就会让扇形参数与源错位；
+7. 受 `MaxSceneGpuVisionSources` 截断后交给渲染线程。
 
-同一批数据也按队伍暴露给 CPU 侧消费者：`CollectVisionSourcesByTeam()`，供探索层等逻辑自行累积历史（本插件只维护“当前帧可见性”）。
+同一批数据也按队伍暴露给 CPU 侧消费者：`CollectVisionSourcesByTeam()`（`FFogVisionSource`：中心 + 两条半径口径 + 中轴 + `HalfAngleCos`），供探索层等逻辑自行累积历史（本插件只维护“当前帧可见性”）。
+
+## CPU 侧视野形状（探索层 / 当前可见层）
+
+`UMassBattleMapSubsystem` 是 CPU 侧的同一条视野链路：它拿 `CollectVisionSourcesByTeam()` 的结果，逐格落盘两支队伍的**已探索层**与**当前可见层**（`RasterizeVisionShapes`，两层共用一次遍历）。形状处理与 GPU 侧一一对应：
+
+| | GPU（画面） | CPU（探索层 / 可见层） |
+| --- | --- | --- |
+| 形状来源 | `FFogVisionSource` → `SceneGpuVisionSourceDirs` | `FFogVisionSource` → `FVisionSource::ForwardDir / HalfAngleCos` |
+| 全向哨兵 | `cosHalfAngle >= 1` → 着色器整段跳过 | `HalfAngleCos >= 1` → `bSector = false`，逐格判定里整段跳过 |
+| 裁剪判据 | `dot(ToTexel / Distance, Dir.xy) < Dir.z` → `continue` | `Dx * Fx + Dy * Fy >= CosHalfAngle * sqrt(DistSq)` → 两层都不写 |
+| 源自己所在单元 | `Distance > 1e-4` 守卫（NaN 防护） | `DistSq <= 1e-6` 时直接算命中（避免脚下留洞） |
+| 外接框 | 保持圆的外接矩形 | 用扇形外接 AABB 收紧（见下） |
+| 边界 | 半径方向由 `SceneFogEdgeWidth` 软化，直边硬 | 全硬边（格心口径，格边长本身就是量化粒度） |
+
+几处 CPU 侧特有的取舍：
+
+- **扇形外接框**：CPU 每次刷新要扫全图 × 每条源，所以预处理阶段就按“角度区间上 cos 的极值”算出扇形 AABB 并夹进圆的安全框（`IntervalCosMax / IntervalCosMin`）。窄扇形（例如 60°）的 X 跨度可能只有圆的一半量级，不收就等于白扫大半的行。框是**安全超集**（两端各外扩一格吸收取整误差），精确性仍由逐格判定保证。
+- **方向缺失时退化为全向，而不是退化为 +X**：拿不到 `FRotating`、或方向是零向量时按全向处理（这里是 `TryGetVisionSector` 返回 false，不是“填个默认方向继续当扇形”）。最坏是“雾少遮了一块”，而按 +X 处理会让单位的视野整块**指错方向** —— 前者是保守的视觉误差，后者是把可见区域判错，代价不对等。CPU 侧还额外有一道“方向向量近似单位长度”（`DirLenSq > 0.5`）的门槛作为纵深防御：一条被写坏的记录不会变成“几乎什么都看不见”（那会直接把该队可见层抹空，而 RL 观测的 `bVisible` 就建在它上面）。
+- **形状必须参与“输入未变”的比较**（`AreVisionSourcesEqual`）：扇形单位**原地转身**时位置与半径都没变，但可见层内容整片改变。漏比这两项 = “转向后可见性永久停在转身前那一帧”，且完全无声。
+- **两层共用同一形状**：形状描述的是“这个单位往哪看、看多宽”，是视野源自身的属性，与“用含余量的半径还是真实视距”正交。所以它不做两套 —— 扇形裁剪对两条半径都只是“先按角筛、再按半径筛”。
 
 ## 历史已探索层（记录/灰雾通道）
 
@@ -153,10 +212,13 @@ FFogOfWarExploredLayerProvider::Set(FFogOfWarGetExploredLayerDelegate::CreateUOb
 
 ## 已知取舍
 
-- **投影平面**：视野圆盘固定投影在 `SceneFogWorldPlaneZ` 平面上。像素所在表面高出它 `h` 时，屏幕上会有约 `h / tan(俯仰角)` 的偏移（例如 55° 俯角、200 cm 高度 → 约 140 cm）。这个量级由 `SceneGpuVisionSourceRadiusPadding`（默认 300 cm）覆盖，因此“该看见的仍然看得见”；地形整体抬高时把 `SceneFogWorldPlaneZ` 设成地面高度即可消除偏移。合成趟的反投影用的是同一个平面，因此两边的误差同号，不会互相放大。
+- **投影平面**：视野形状（圆盘 / 扇形）固定投影在 `SceneFogWorldPlaneZ` 平面上。像素所在表面高出它 `h` 时，屏幕上会有约 `h / tan(俯仰角)` 的偏移（例如 55° 俯角、200 cm 高度 → 约 140 cm）。这个量级由 `SceneGpuVisionSourceRadiusPadding`（默认 300 cm）覆盖，因此“该看见的仍然看得见”；地形整体抬高时把 `SceneFogWorldPlaneZ` 设成地面高度即可消除偏移。合成趟的反投影用的是同一个平面，因此两边的误差同号，不会互相放大。⚠ 注意这个余量只补**半径**，扇形张角不受它影响，所以扇形的两条直边在斜视时会看到与地面网格一致的投影偏移。
 - **场分辨率**：场分辨率 ≈ 地图尺寸 / `VisionFieldTexelSizeCm`，每轴上限 2048 纹素（超过时按比例放大纹素边长，场仍铺满整个地图矩形）。它不再跟随视口分辨率：相机推近时雾边不会变得更精确，而是由合成趟的双线性采样软化。这是拿“与相机解耦 + 重叠成本固定”换来的。
 - **场纹理目前仍是每帧每视图重建**：场是世界空间的，理论上可以跨视图共享，但当前实现没有做跨帧/跨视图缓存（场是 transient 的）。多视口（分屏 / SceneCapture）会把散射做多遍。若将来需要，可把场提成持久资源并只在视野源变化时重算。
 - **灰雾有延迟**：已探索层由 CPU 侧按自己的节奏刷新（本工程里是 0.1s 节流），因此“刚照亮过的区域立刻转灰”会比画面本身晚一个刷新周期。它不该被当成渲染问题去查。
+- **扇形边界是硬边，且落在格/纹素中心上**：GPU 侧只软化半径方向（`SceneFogEdgeWidth`），CPU 侧一概硬边。逐格/逐纹素判定意味着边界有“一个单元宽”的量化误差（CPU 格边长 256 cm，比 GPU 纹素粗得多），所以**探索层的扇形边界会比画面的雾边界粗一档**。这是格网分辨率决定的，不是两套判据分叉 —— 判据本身逐字一致。
+- **扇形让“输入未变则整段跳过”更难命中**：`AreVisionSourcesEqual` 把朝向纳入比较后，**转向中的单位**每次刷新都算作“输入变了”，于是那一队的整段跳过失效、探索层光栅照常跑。圆形的旧行为里只有“位置 / 半径变化”才会触发，现在朝向变化同样触发。这是正确性要求的代价（不比较朝向就会让可见层停在转身前那一帧），不是可以靠调参绕开的开销 —— 真要省，应该从“朝向变化幅度小于一个格尺度的量化阈值”入手，而不是把它从比较里删掉。
+- **扇形依赖 `FRotating`**：朝向缺失（实体没有该 fragment）或方向为零向量时退化为全向。也就是说**定点炮台这类不写朝向的实体拿不到扇形**，只能拿到整圈视野；需要它按朝向揭雾时，得让它有一个有效的 `FRotating::Direction`。
 - **作用范围**：注册的是世界作用域的扩展，因此该世界的**所有视图**都会走这三趟 pass（包括编辑器视口与 SceneCapture）。旧的 `UPostProcessComponent` 已经删除，不再有 `BlendRadius/BlendWeight` 这种“局部生效”的语义。
 - **平台**：`ShouldCompilePermutation` 限定 SM5。依赖三件事：`PF_R32_UINT` 的 UAV 与 `InterlockedMax`、`PF_R8G8` 渲染目标、compute dispatch 的 Z 维（源数上限受 `GRHIMaxDispatchThreadGroupsPerDimension.Z` 约束，`MaxSceneGpuVisionSources` 的默认值远低于它）。
 
@@ -165,6 +227,12 @@ FFogOfWarExploredLayerProvider::Set(FFogOfWarGetExploredLayerDelegate::CreateUOb
 - 抓帧看 `FogOfWar.VisionFieldSplat(N)`（N = 本帧源数）、`FogOfWar.VisionFieldPack`、`FogOfWar.Composite`。
 - 散射趟的成本与 `Σ 每条源 AABB 的纹素数` 成正比，与视口分辨率、与相机距离都无关；几何路线的散射成本则随相机推近而暴涨。对比这两个数字可以直接看出收益。
 - 想验证 overdraw 确实被消掉：把 `VisionFieldTexelSizeCm` 调小（场更细）时成本应线性上升，而**不会**像几何路线那样按重叠层数成倍上升。
+- **验证 CPU 与 GPU 是同一个扇形**：给一个单位设 `Common::TraceAngle = 90`，让它原地转身（不给位移指令）——
+  画面上的雾边界应当跟着转，同时 `IsWorldLocationVisibleForTeam` 在它背后应当翻成 `false`。
+  两边**同步**才说明形状只有一份；如果画面转了而 `bVisible` 没变，去看 `AreVisionSourcesEqual`（朝向没进比较）。
+  转一圈后统计 `Saved/Logs` 里的“迷雾刷新整段跳过”次数会明显下降 —— 这是扇形带来的预期代价，不是回归。
+- **量扇形裁剪的收益**：把 `TraceAngle` 从 360 调到 90，同一次刷新里 CPU 侧的两层光栅耗时应下降（外接框收紧 + 逐格角判）；
+  GPU 侧的散射趟成本基本不变（AABB 仍是圆的外接矩形，只少了原子写入），差异主要落在“重叠区写入次数”上。
 - `Saved/Logs/FogOfWar_ScenePerf.csv` 每 `SceneGpuVisionPerformanceLogInterval` 秒一行：
   `WorldTime,Channel,Samples,AvgTotalMs,AvgCollectMs,AvgUploadMs,AvgSourceCount,AvgVisitedCells,AvgVisitedAgents,AvgCulledSources,AvgContainedSources`
   `AvgUploadMs` 现在只记“交接给渲染线程”的耗时（应该是接近 0 的小量）；GPU 侧成本不再由这些 CPU 数字反映，请看抓帧。
