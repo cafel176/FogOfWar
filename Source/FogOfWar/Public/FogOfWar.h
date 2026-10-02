@@ -292,6 +292,15 @@ public:
 	///          下一帧换回上一帧的缓冲继续复用，因此稳态下不产生分配。
 	TArray<FVector4f> SceneGpuVisionSources;
 
+	/// @brief 与 SceneGpuVisionSources **一一对应**的扇形参数：(dirX, dirY, cosHalfAngle, 0)。
+	/// @details cosHalfAngle >= 1 表示"全向"（着色器据此跳过扇形判定）；否则像素相对源中心的方向与
+	///          (dirX, dirY) 的夹角必须 <= halfAngle 才算被这条源揭雾。
+	///          朝向取自单位自身的 FRotating::Direction（每帧变，因此不在 FMassVisionFragment 里缓存），
+	///          张角取自 FMassVisionFragment::SightAngleDegrees（由 Bootstrap 从索敌 Common 参数写入）。
+	/// @note 两条数组必须**同增同删**：收集循环把它们当作一个整体（见 .cpp 里的
+	///       FFogSceneVisionSourceEntry），沿用同一套视图剔除与圆盘包含剔除判定。
+	TArray<FVector4f> SceneGpuVisionSourceDirs;
+
 	/// @brief 最近一次采用的已探索层版本号（由提供者给出）。
 	/// @details 只有它变化时才重新取位图并交给渲染线程：探索层每秒只变几次，而这里是每帧一次。
 	///          INDEX_NONE 表示“当前没有可用的已探索层”（无提供者 / 网格未就绪 / 观察队伍不可用），

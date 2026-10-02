@@ -165,6 +165,17 @@ struct FOGOFWAR_API FMassVisionFragment : public FMassFragment
 	///             无索敌配置或该模式无对应半径时用 UMinimapDataSubsystem::DefaultMassBattleSightRadius）。
 	UPROPERTY(EditAnywhere, Category = "Fog of War", meta = (ClampMin = 0.0f, UIMin = 0.0f))
 	float SightRadius = 1000.0f;
+
+	/// @brief 视野张角（单位：度）。360 = 全向（默认，揭雾形状与旧的圆形完全一致）。
+	/// @details 揭雾形状由"半径 + 张角"共同决定：
+	///          ① 张角 >= 360（或 <= 0）→ 圆盘，与历史行为一致；
+	///          ② 张角 < 360 → 以 SightRadius 为半径、以**单位朝向**为中轴的扇形
+	///             （朝向取 FRotating::Direction，在收集视野源时按帧读取，不在本 fragment 里缓存）。
+	///          写入者与 SightRadius 同源：UMassBattleFogOfWarBootstrapProcessor 会按
+	///          FTrace::Mode 的通用(Common)参数一并写入 TraceAngle，二者始终来自同一组索敌配置，
+	///          因此"看得见哪里"与"索敌扫哪里"天然一致。
+	UPROPERTY(EditAnywhere, Category = "Fog of War", meta = (ClampMin = 0.0f, ClampMax = 360.0f, UIMin = 0.0f, UIMax = 360.0f))
+	float SightAngleDegrees = 360.0f;
 };
 
 /**

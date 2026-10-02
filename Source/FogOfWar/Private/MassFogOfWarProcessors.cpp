@@ -348,6 +348,10 @@ void UMassBattleFogOfWarBootstrapProcessor::Execute(FMassEntityManager& EntityMa
 			// 揭雾半径来自实体自身的索敌配置：按 FTrace::Mode 取该模式通用(Common)参数的索敌半径
 			// （无索敌配置/该模式无对应半径时回退 DefaultSightRadius）。
 			VisionFragment.SightRadius = FogOfWarVision::ResolveSightRadiusCm(EntityManager, Entity, DefaultSightRadius);
+			// 揭雾张角与半径**同源**：同一组 Common 参数里的 TraceAngle。这样"看得见哪里"与
+			// "索敌扫哪里"用的是同一份配置，不会因为两处各取一套参数而错位。
+			// 无索敌配置 / 该模式无张角时回退 360（全向），即退化为旧的圆形揭雾。
+			VisionFragment.SightAngleDegrees = FogOfWarVision::ResolveSightAngleDegrees(EntityManager, Entity, 360.0f);
 			Context.Defer().PushCommand<FMassCommandAddFragmentInstances>(Entity, VisionFragment);
 
 			if (!bHasPreviousVision)

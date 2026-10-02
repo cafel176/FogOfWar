@@ -379,6 +379,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	// 本帧的视野源清单：Reset 保留容量，Add 到 Num == 实际条数。交给渲染线程之后，下一帧会换回
 	// 上一帧用过的缓冲，因此稳态下这里不产生任何分配。
 	SceneGpuVisionSources.Reset();
+	SceneGpuVisionSourceDirs.Reset();
 
 	int32 VisitedCells = 0;
 	int32 VisitedAgents = 0;
@@ -422,11 +423,13 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	int32 ContainedSources = 0;
 
 	// 单格内的候选视野源：逐格复用同一块内存，避免每格一次分配。它只服务于"圆盘包含剔除"，
-	// 通过剔除的候选才收进本帧清单。
+	// 通过剔除的候选才收进本帧清单。CellDirs 与 CellSources **同索引、同增删**：扇形参数必须
+	// 跟着自己的源一起被包含剔除回收，否则两条数组会错位（源 A 用上源 B 的朝向）。
 	TArray<FVector4f> CellSources;
+	TArray<FVector4f> CellDirs;
 
 	const double CollectStartTime = FPlatformTime::Seconds();
-	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents, &ViewCullPlanes, bUseViewCulling, &CulledSources, &ContainedSources, &CellSources](const FHashGridAgentCell& Cell)
+	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents, &ViewCullPlanes, bUseViewCulling, &CulledSources, &ContainedSources, &CellSources, &CellDirs](const FHashGridAgentCell& Cell)
 	{
 		if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 		{
@@ -435,6 +438,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 
 		VisitedCells++;
 		CellSources.Reset();
+		CellDirs.Reset();  // 必须与 CellSources 同步清空：跨格残留会让扇形参数与源错位
 		for (const FAgentGridData& AgentData : Cell.Agents)
 		{
 			VisitedAgents++;
@@ -473,12 +477,41 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 
 			const FVector4f Candidate(static_cast<float>(WorldLocation.X), static_cast<float>(WorldLocation.Y), UploadRadius, 0.0f);
 
+			// 扇形参数：张角来自视野碎片（Bootstrap 从索敌 Common::TraceAngle 写入），朝向取单位
+			// 自身 —— 朝向每帧都变，所以不缓存进碎片，在这里现取。张角 >= 360（或 <= 0）、拿不到
+			// 朝向时写全向哨兵（cosHalfAngle = 2 > 1），着色器据此跳过扇形判定，行为与旧的圆形
+			// 揭雾完全一致。
+			FVector4f CandidateDir(0.0f, 0.0f, 2.0f, 0.0f);
+			if (const FMassVisionFragment* VisionForDir = EntityManager.GetFragmentDataPtr<FMassVisionFragment>(AgentData.EntityHandle))
+			{
+				if (VisionForDir->SightAngleDegrees > 0.0f && VisionForDir->SightAngleDegrees < 360.0f)
+				{
+					FVector Forward = FVector::ForwardVector;
+#if FOW_HAS_MASSBATTLE_ROTATION
+					if (const FOW_ROTATION_FRAGMENT* Rotation = EntityManager.GetFragmentDataPtr<FOW_ROTATION_FRAGMENT>(AgentData.EntityHandle))
+					{
+						const FVector RotationDir = FVector(FOW_GET_ROTATION_DIRECTION(*Rotation));
+						if (RotationDir.SizeSquared2D() > KINDA_SMALL_NUMBER)
+						{
+							Forward = RotationDir.GetSafeNormal2D();
+						}
+					}
+#endif
+					const float HalfAngleRad = FMath::DegreesToRadians(VisionForDir->SightAngleDegrees * 0.5f);
+					CandidateDir = FVector4f(
+						static_cast<float>(Forward.X), static_cast<float>(Forward.Y),
+						FMath::Cos(HalfAngleRad), 0.0f);
+				}
+			}
+
 			// 圆盘包含剔除（判据见 IsDiscContainedIn，集合等价、零画面误差）：
 			// ① 本格已收下的某个候选包含本候选 → 本候选整条丢掉；
 			// ② 本候选包含本格已收下的某个候选 → 把被包含的那条回收（它已无必要保留）。
 			// 搜索范围就是同一个 HashGrid 格（250cm 量级），覆盖"单位挤在一起 / 单位贴着自己的建筑"
 			// 这类最常见的重叠；跨格的大圆包小圆不会被这次剔除发现 —— 这不影响正确性（被删掉的源一定
 			// 是冗余的），只影响收益上限。
+			// ⚠ 圆盘包含剔除对扇形源是**保守**的（圆 ⊇ 扇形，被删的源其扇形一定也被保留下来的圆盖住），
+			//    但扇形的"方向"信息不能丢：所以 CellDirs 必须与 CellSources 同索引增删。
 			bool bContained = false;
 			for (int32 KeptIndex = CellSources.Num() - 1; KeptIndex >= 0; --KeptIndex)
 			{
@@ -491,6 +524,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 				if (IsDiscContainedIn(Kept, Candidate))
 				{
 					CellSources.RemoveAtSwap(KeptIndex);
+					CellDirs.RemoveAtSwap(KeptIndex);
 				}
 			}
 
@@ -501,17 +535,19 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 			}
 
 			CellSources.Add(Candidate);
+			CellDirs.Add(CandidateDir);
 		}
 
 		// 通过两道剔除的格内候选按遍历顺序收进清单。顺序无要求：散射时重叠圆盘之间取并集，
-		// 与先后无关。
-		for (const FVector4f& Source : CellSources)
+		// 与先后无关。两条数组必须同时追加，保持同索引。
+		for (int32 SourceIndex = 0; SourceIndex < CellSources.Num(); ++SourceIndex)
 		{
 			if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 			{
 				break;
 			}
-			SceneGpuVisionSources.Add(Source);
+			SceneGpuVisionSources.Add(CellSources[SourceIndex]);
+			SceneGpuVisionSourceDirs.Add(CellDirs[SourceIndex]);
 		}
 	};
 
@@ -622,6 +658,7 @@ void AFogOfWar::UploadSceneGpuVisionSources(bool bSceneFogActive)
 	// 清单本身会被交换走，换回来的是上一帧用过的缓冲（见调用方开头的 Reset）。
 	SceneFogViewExtension->UploadFrameData_GameThread(
 		SceneGpuVisionSources,
+		SceneGpuVisionSourceDirs,
 		Settings,
 		ComputeSceneFogVisionField(FieldWorldMin, FieldWorldSize, VisionFieldTexelSizeCm),
 		bSceneFogActive);

@@ -145,6 +145,7 @@ public:
 	 */
 	void UploadFrameData_GameThread(
 		TArray<FVector4f>& InOutSources,
+		TArray<FVector4f>& InOutSourceDirs,
 		const FFogOfWarSceneFogSettings& InSettings,
 		const FFogOfWarSceneVisionField& InField,
 		bool bInSceneFogActive);
@@ -172,6 +173,11 @@ private:
 	/// @brief 游戏线程写入 / 渲染线程读取的交换区。
 	FCriticalSection PendingLock;
 	TArray<FVector4f> PendingSources;
+
+	/// @brief 与 PendingSources 同索引的扇形参数 (dirX, dirY, cosHalfAngle, 0)；cosHalfAngle >= 1 = 全向。
+	/// @details 与 PendingSources 一起交换，保证渲染线程看到的两条数组永远同帧同索引。
+	TArray<FVector4f> PendingSourceDirs;
+
 	FFogOfWarSceneFogSettings PendingSettings;
 	FFogOfWarSceneVisionField PendingField;
 	FFogOfWarSceneExploredLayer PendingExploredLayer;
@@ -189,6 +195,9 @@ private:
 	TArray<FVector4f> RenderThreadSources;
 	FFogOfWarSceneFogSettings RenderThreadSettings;
 	FFogOfWarSceneVisionField RenderThreadField;
+
+	/// @brief 渲染线程手里的本帧扇形参数快照，与 RenderThreadSources 同索引、同帧。
+	TArray<FVector4f> RenderThreadSourceDirs;
 
 	/** 渲染线程手里的"本帧是否应遮蔽"快照（含义见 UploadFrameData_GameThread）。 */
 	bool RenderThreadSceneFogActive = true;

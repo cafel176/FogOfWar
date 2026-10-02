@@ -41,4 +41,31 @@ namespace FogOfWarVision
 		const FMassEntityManager& InEntityManager,
 		const FMassEntityHandle InEntity,
 		float InFallbackCm);
+
+	/**
+	 * @brief 解析实体的揭雾张角（单位：度，360 = 全向）。
+	 * @details 与 ResolveSightRadiusCm 同源、同映射表：按 FTrace::Mode 分派到该模式实际使用的
+	 *          索敌参数结构，取其"通用(Common)"参数中的索敌张角 TraceAngle：
+	 *
+	 *          | FTrace::Mode        | 张角来源                                  |
+	 *          |---------------------|-------------------------------------------|
+	 *          | SectorTraceByTraits | FTrace::SectorTrace::Common::TraceAngle   |
+	 *          | TargetIsPlayer_0    | 该模式不使用扇形索敌参数，无对应张角 → 回退 |
+	 *
+	 *          正因为半径与张角取自**同一组** Common 参数（同一个函数模板、同一个 switch），
+	 *          "揭雾扇形"与"索敌扇形"不会出现半径一个模式、角度另一个模式的错配。
+	 *
+	 *          以下情况一律回退到 InFallbackDegrees（调用方通常传 360，即退化为圆形）：
+	 *          ① 实体没有 FTrace；② FTrace::bEnable == false；③ 取到的张角 <= 0；
+	 *          ④ FogOfWar 未开启 MassBattle 绑定（FOW_HAS_MASSBATTLE_TRACE == 0）。
+	 *
+	 * @param InEntityManager 实体管理器（只读）。
+	 * @param InEntity        目标实体句柄。
+	 * @param InFallbackDegrees 回退张角（度），通常传 360。
+	 * @return 该实体的揭雾张角（度）；无法从索敌配置解析时返回 InFallbackDegrees。
+	 */
+	FOGOFWAR_API float ResolveSightAngleDegrees(
+		const FMassEntityManager& InEntityManager,
+		const FMassEntityHandle InEntity,
+		float InFallbackDegrees);
 }

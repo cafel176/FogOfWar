@@ -66,6 +66,13 @@ float SceneFogEdgeWidth;
 // 每条视野源一个 float4：(WorldX, WorldY, Radius, Reserved)。
 StructuredBuffer<float4> VisionSources;
 
+// 与 VisionSources 同索引的扇形参数：(dirX, dirY, cosHalfAngle, Reserved)。
+//   cosHalfAngle >= 1 → 该源是全向的（CPU 侧对张角 >= 360 的源写 2.0），扇形判定整体跳过；
+//   否则只有"像素相对源中心的方向"与 (dirX, dirY) 的夹角 <= halfAngle 时才揭雾。
+// 朝向来自单位自身的朝向，张角来自索敌配置的 Common::TraceAngle —— 与 VisionSources 里
+// 的半径同源，所以揭雾扇形与索敌扇形天然一致。
+StructuredBuffer<float4> VisionSourceDirs;
+
 // 每条视野源在场空间里的保守 AABB：xy = 最小纹素（含），zw = 最大纹素（不含）。
 // CPU 端由"圆心 ± 半径"直接算成纹素矩形并 clamp 到场范围，不含任何投影。
 StructuredBuffer<uint4> VisionSourceAabbs;
@@ -95,7 +102,21 @@ void VisionFieldSplatCS(uint3 GroupID : SV_GroupID, uint3 GroupThreadID : SV_Gro
 		for (uint X = AabbMin.x + GroupThreadID.x; X < AabbMax.x; X += VISION_FIELD_GROUP_SIZE)
 		{
 			const float2 TexelCenter = FieldWorldMin + (float2(X, Y) + 0.5) * FieldTexelSizeCm;
-			const float Distance = length(TexelCenter - Center);
+			const float2 ToTexel = TexelCenter - Center;
+			const float Distance = length(ToTexel);
+
+			// 扇形裁剪：Dir.z 是 cos(半角)。>= 1 表示全向（CPU 对张角 >= 360 的源写 2.0），
+			// 整段跳过 —— 圆形揭雾的老行为一字不改。
+			// 判定用"像素相对源中心的方向"：落在扇形之外就完全不揭雾（硬边；半径方向仍由上面的
+			// SceneFogEdgeWidth 软化）。注意要先避开 Distance ≈ 0，否则归一化会出 NaN。
+			const float4 Dir = VisionSourceDirs[SourceIndex];
+			if (Dir.z < 1.0 && Distance > 1e-4)
+			{
+				if (dot(ToTexel / Distance, Dir.xy) < Dir.z)
+				{
+					continue;
+				}
+			}
 
 			// 圆内 1、圆外 0，边缘按 SceneFogEdgeWidth 在半径内侧软化。
 			// 软化宽度为 0 时走硬边分支：smoothstep 在 min == max 上是未定义行为，不能靠它退化。

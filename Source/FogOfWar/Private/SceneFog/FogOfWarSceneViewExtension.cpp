@@ -77,6 +77,10 @@ public:
 		/** 每帧的视野源表：(WorldX, WorldY, Radius, Reserved)。 */
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VisionSources)
 
+		// 与 VisionSources 同索引的扇形参数 (dirX, dirY, cosHalfAngle, 0)。
+		// cosHalfAngle >= 1 表示该源是全向的（CPU 对张角 >= 360 的源写 2.0），着色器据此跳过扇形判定。
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, VisionSourceDirs)
+
 		/** 每条源的场 AABB：xy = 最小纹素（含），zw = 最大纹素（不含）。 */
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, VisionSourceAabbs)
 
@@ -246,6 +250,7 @@ FFogOfWarSceneViewExtension::FFogOfWarSceneViewExtension(const FAutoRegister& Au
 
 void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
 	TArray<FVector4f>& InOutSources,
+	TArray<FVector4f>& InOutSourceDirs,
 	const FFogOfWarSceneFogSettings& InSettings,
 	const FFogOfWarSceneVisionField& InField,
 	bool bInSceneFogActive)
@@ -257,6 +262,9 @@ void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
 	// 交换而不是拷贝：交出去的数组与换回来的上一帧缓冲都留在原地复用，两侧都不会产生分配
 	//（调用方拿回数组后 Reset + Add 复用它的容量即可）。
 	Swap(PendingSources, InOutSources);
+	// 扇形参数与视野源必须**同帧同索引**：一起交换，绝不允许只更新其中一条 —— 否则渲染线程会
+	// 拿这一帧的朝向去裁剪上一帧的源（画面表现为扇形的朝向随机漂移）。
+	Swap(PendingSourceDirs, InOutSourceDirs);
 	PendingSettings = InSettings;
 	PendingField = InField;
 	PendingSceneFogActive = bInSceneFogActive;
@@ -289,6 +297,7 @@ void FFogOfWarSceneViewExtension::SubscribeToPostProcessingPass(
 	{
 		FScopeLock Lock(&PendingLock);
 		RenderThreadSources = PendingSources;
+		RenderThreadSourceDirs = PendingSourceDirs;  // 与 RenderThreadSources 同帧、同索引
 		RenderThreadSettings = PendingSettings;
 		RenderThreadField = PendingField;
 		RenderThreadSceneFogActive = PendingSceneFogActive;
@@ -431,6 +440,18 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 		auto* SplatParameters = GraphBuilder.AllocParameters<FFogOfWarSceneVisionFieldSplatCS::FParameters>();
 		SplatParameters->VisionSources = GraphBuilder.CreateSRV(VisionSourceBuffer);
 		SplatParameters->VisionSourceAabbs = GraphBuilder.CreateSRV(AabbBuffer);
+
+		// 扇形参数缓冲：(dirX, dirY, cosHalfAngle, 0)，与 VisionSources 同索引、同长度。
+		// 与视野源同帧上传 —— 数量上二者恒等（CPU 侧成对增删），因此这里不做长度校验。
+		FRDGBufferRef VisionSourceDirBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), SourceCount),
+			TEXT("FogOfWar.VisionSourceDirs"));
+		GraphBuilder.QueueBufferUpload(
+			VisionSourceDirBuffer,
+			RenderThreadSourceDirs.GetData(),
+			SourceCount * sizeof(FVector4f),
+			ERDGInitialDataFlags::None);
+		SplatParameters->VisionSourceDirs = GraphBuilder.CreateSRV(VisionSourceDirBuffer);
 		SplatParameters->VisionCoverage = CoverageUAV;
 		SplatParameters->FieldWorldMin = FieldWorldMin;
 		SplatParameters->FieldTexelSizeCm = Field.TexelSizeCm;
