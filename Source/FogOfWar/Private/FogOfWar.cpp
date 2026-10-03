@@ -492,21 +492,39 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 
 	FMassEntityManager& EntityManager = EntitySubsystem->GetMutableEntityManager();
 
-	// 按当前观察队伍过滤视野源：只收集与本地玩家同队的单位视野，避免敌方单位周围也被揭雾。
-	// 观察队伍来自外部注册的提供者（FFogOfWarViewingTeamProvider，本工程注册的是
-	// UMassBattleGlobalVarFunctionLibrary::GetTeam）；提供者未注册或不可用时返回 INDEX_NONE，
-	// 此时退化为不按队伍过滤（全场并集），避免整屏变黑。
+	// 观察队伍：既决定"本帧要不要画雾"，也决定"收哪一队的视野源"。来自外部注册的提供者
+	// （FFogOfWarViewingTeamProvider，本工程注册的是 UMassBattleGlobalVarFunctionLibrary::GetTeam）；
+	// 提供者未注册、或注册方返回负值时，这里都得到 INDEX_NONE。
 	const int32 ViewingTeamIndex = FFogOfWarViewingTeamProvider::GetViewingTeam(this);
-	const bool bFilterVisionSourcesByTeam = (ViewingTeamIndex != INDEX_NONE && ViewingTeamIndex != 127);
-	if (!bFilterVisionSourcesByTeam)
+
+	// 观察者（INDEX_NONE）/ 管理员（127）：**完全不画雾**。
+	// 这两个角色要能不受遮蔽地查看整张地图，这正是队伍面板上那两个按钮的用途；传 false 时渲染侧
+	// 连一次全屏 pass 都不注入（见 FFogOfWarSceneViewExtension::UploadFrameData_GameThread 的 ①），
+	// 与"雾开着、只是本帧一条视野源都没收到"那种**整屏遮蔽**是两种不同语义，不能混为一谈。
+	//
+	// 放在收集之前：观察整张地图期间不必遍历 HashGrid，雾是零成本 —— 而这恰恰是"看全局"时最需要的。
+	//
+	// ⚠ 提供者未注册时会落到同一个分支（GetViewingTeam 对"未注册"与"注册方说是观察者"返回同一个值）。
+	//   这是刻意的：本插件无权替业务决定"不知道该显示谁"时该画什么，而"不遮蔽"是更安全的一侧
+	//   （配置缺失的后果至多是看不到雾，而不是把谁的视野糊掉）。下面这条日志把两种成因都写出来，
+	//   省得日后有人把"没注册"误当成"观察者模式生效了"。
+	if (ViewingTeamIndex == INDEX_NONE || ViewingTeamIndex == 127)
 	{
-		static bool bWarnedMissingViewingTeam = false;
-		if (!bWarnedMissingViewingTeam)
+		static bool bLoggedFogDisabledByTeam = false;
+		if (!bLoggedFogDisabledByTeam)
 		{
-			bWarnedMissingViewingTeam = true;
-			UE_LOG(LogFogOfWar, Warning, TEXT("Viewing team is unavailable (no viewing team provider registered, or it returned INDEX_NONE); scene vision sources will not be filtered by team."));
+			bLoggedFogDisabledByTeam = true;
+			UE_LOG(LogFogOfWar, Log,
+				TEXT("场景雾已按观察队伍关闭：当前视角队伍是观察者/管理员（INDEX_NONE 或 127），本帧起不再注入任何雾 pass。")
+				TEXT("若这不是预期行为，先确认观察队伍提供者已注册 —— 未注册时本查询同样返回 INDEX_NONE。"));
 		}
+
+		UploadSceneGpuVisionSources(/*bSceneFogActive=*/false);
+		return;
 	}
+
+	// 走到这里视角队伍一定是一个具体队伍（INDEX_NONE 与 127 都已在上面返回），因此视野源**总是**
+	// 按队伍过滤：只收集与本地玩家同队的单位视野，避免敌方单位周围也被揭雾。
 
 	// 视图剔除平面每帧只构建一次，供全部视野源复用。开关关闭或相机不可用时平面为空，
 	// IsVisionSourcePossiblyVisible 恒返回 true，收集循环里不需要再为开关分支。
@@ -522,7 +540,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	TArray<FVector4f> CellDirs;
 
 	const double CollectStartTime = FPlatformTime::Seconds();
-	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, bFilterVisionSourcesByTeam, &EntityManager, &VisitedCells, &VisitedAgents, &ViewCullPlanes, bUseViewCulling, &CulledSources, &ContainedSources, &CellSources, &CellDirs](const FHashGridAgentCell& Cell)
+	auto UploadCellVisionSources = [this, SafeMaxSources, ViewingTeamIndex, &EntityManager, &VisitedCells, &VisitedAgents, &ViewCullPlanes, bUseViewCulling, &CulledSources, &ContainedSources, &CellSources, &CellDirs](const FHashGridAgentCell& Cell)
 	{
 		if (SceneGpuVisionSources.Num() >= SafeMaxSources)
 		{
@@ -544,7 +562,8 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 
 			// 视野源规则（有效性 + 队伍过滤 + 半径余量）统一收敛在 TryGetVisionSourceRadius 内，
 			// 与 CPU 侧逐队收集共用同一份规则；这里只负责"筛选 + 写进 GPU 缓冲 + 计数"。
-			// 观察队伍不可用（INDEX_NONE）时退化为不按队伍过滤（全场并集），避免整屏变黑。
+			// 队伍过滤直接用 ViewingTeamIndex：走到这里它必定是一个具体队伍（观察者/管理员已在函数
+			// 开头返回，不会收集任何源），因此不存在"按 INDEX_NONE 过滤 = 不过滤"那种歧义。
 			float UploadRadius = 0.0f;
 			// 扇形参数与半径在同一次判定里取回：朝向碎片的读取与"要不要读"的决策都收在
 			// TryGetVisionSourceRadius 内部，这里不再单独查一次碎片（见该函数的参数说明）。
@@ -553,7 +572,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 			if (!TryGetVisionSourceRadius(
 				EntityManager,
 				AgentData,
-				bFilterVisionSourcesByTeam ? ViewingTeamIndex : INDEX_NONE,
+				ViewingTeamIndex,
 				SceneGpuVisionSourceRadiusPadding,
 				UploadRadius,
 				/*OutTeamIndex=*/nullptr,

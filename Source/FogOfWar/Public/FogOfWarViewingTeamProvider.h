@@ -10,7 +10,8 @@
 /**
  * @brief 观察队伍查询委托。
  * @details 入参与返回值口径与 UMassBattleGlobalVarFunctionLibrary::GetTeam 完全一致：
- *          入参为世界上下文对象，返回当前观察队伍下标；返回负值（INDEX_NONE）表示“队伍不可用”。
+ *          入参为世界上下文对象，返回当前观察队伍下标；返回负值（INDEX_NONE）表示“队伍不可用”
+ *          （在本工程里就是队伍面板上的“观察者”一档）。
  */
 DECLARE_DELEGATE_RetVal_OneParam(int32, FFogOfWarGetViewingTeamDelegate, const UObject* /* WorldContextObject */);
 
@@ -21,8 +22,12 @@ DECLARE_DELEGATE_RetVal_OneParam(int32, FFogOfWarGetViewingTeamDelegate, const U
  *          直接调用 UMassBattleGlobalVarFunctionLibrary::GetTeam 会让本插件反向依赖 MassBattleSystem，
  *          与该模块的依赖方向（MassBattleSystem → MassBattleMap → FogOfWar）相冲突。
  *          因此改为：外部（MassBattleSystem 模块启动时）把该函数注册进来，本插件只经本类查询。
- *          未注册、或注册方返回负值时，查询结果为 INDEX_NONE，调用方按“队伍不可用”处理
- *          （场景视野源退化为不按队伍过滤，避免整屏变黑）。
+ *
+ *          未注册、或注册方返回负值时，查询结果都是 INDEX_NONE。本类**不区分**这两者：
+ *          它只负责给一个值，“未注册”与“观察者”在语义上的差别由调用方按需处理。
+ *          场景雾那边的口径是：INDEX_NONE 与 127（管理员）都**不再遮蔽画面** ——
+ *          “不知道该显示谁”时，不遮蔽是更保守的一侧（后果至多是看不到雾，而不是把谁的视野糊掉），
+ *          见 AFogOfWar::UpdateSceneGpuVisionSources。
  */
 struct FOGOFWAR_API FFogOfWarViewingTeamProvider
 {

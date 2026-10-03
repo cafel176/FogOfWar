@@ -138,6 +138,24 @@ SceneGpuVisionPerformanceLogInterval       统计周期（秒）
 
 这些参数每帧随视野源一起作为一份快照交给渲染线程，因此**在 PIE 里改动能立刻生效**。
 
+## 什么时候完全不画雾
+
+`bSceneFogActive = false` 的帧，渲染侧连一次全屏 pass 都不注入 —— 画面就是场景本身，没有雾。
+它与"雾开着但本帧一条视野源都没收到"（覆盖率场全 0 → **整屏遮蔽**）是两种不同语义，别混。产生前者有两条路径：
+
+1. `bEnableSceneGpuVisionSources` 关闭 / Mass 子系统缺失 / 世界正在销毁 —— 原因是"雾系统不可用"；
+2. **当前观察队伍是观察者（`INDEX_NONE`）或管理员（127）** —— 原因是"看的人要看整张地图"。
+   这两个角色是队伍面板上的两个按钮（`UTeamPanelWidgetBase`），用途正是"不受遮蔽地查看全局"。
+
+第 2 条与总开关**相互独立**，且排在视野源收集**之前**：观察整张地图期间根本不去遍历 HashGrid，
+所以观察者模式下雾的成本是零（而不是"采集完再丢掉"）。
+
+一个刻意的取舍：观察队伍提供者（`FFogOfWarViewingTeamProvider`）**未注册**时，查询同样返回
+`INDEX_NONE`，于是也走第 2 条、不画雾。本插件无从判断"当前是谁在看"，此时不遮蔽是更保守的一侧 ——
+后果至多是"看不到雾"，而不是"一个缺失的注册把谁的视野糊掉"。这种情况会打一条一次性日志
+（`LogFogOfWar`），把两种成因都写出来，免得日后把"没注册"误当成"观察者模式生效了"。
+
+
 **揭雾形状不在这张表里** —— 它是逐单位的数据，不是全局开关，来源只有一条链：
 
 ```text
@@ -156,9 +174,11 @@ FTrace::Mode == SectorTraceByTraits
 
 每帧 Tick 走一趟（唯一实现：`FogOfWar.cpp` 内的 `TryGetVisionSourceRadius` / `TryGetVisionSector` / `IsDiscContainedIn`）：
 
+0. 先问“当前观察队伍是谁”（`FFogOfWarViewingTeamProvider`）：若是**观察者（`INDEX_NONE`）或管理员（127）**，
+   本帧直接结束 —— 不遮蔽画面、也不遍历 HashGrid（见上一节）；
 1. 遍历 `UMassBattleHashGridSubsystem::AgentGrid` 的每个 block / cell / agent；
 2. 只要带 `FMassVisionFragment` 且 `SightRadius > 0` 的 Agent，生效半径 = `SightRadius + SceneGpuVisionSourceRadiusPadding`；
-3. 按“观察队伍提供者”（`FFogOfWarViewingTeamProvider`）过滤，提供者缺失时退化为全场并集；
+3. 按观察队伍过滤（走到这一步它必定是一个具体队伍），只留同队单位的视野源；
 4. **揭雾形状**：张角来自 `FMassVisionFragment::SightAngleDegrees`（Bootstrap 从索敌 `Common::TraceAngle` 写入），朝向**当场**读 `FRotating::Direction`（朝向每帧都变，缓存进碎片等于留一份注定过期的影子真值）。两者一起压成“中轴 + cos(张角/2)”，`cos >= 1` 是全向哨兵；
 5. **视图剔除**：完全落在当前视口之外的源不可能覆盖任何输出像素（集合等价，非近似）；
 6. **圆盘包含剔除**：源 A 的圆盘完全落在源 B 的圆盘内（`dist + rA <= rB`）时删掉 A 严格无影响（场取覆盖率最大值）。搜索范围限于同一个 HashGrid 格，因此是“可靠的但未必穷尽”。⚠ 对扇形源这是**保守**的（圆 ⊇ 扇形，被删的源的扇形一定仍被保留下来的圆盖住），但方向必须跟着一起删 —— 所以 `CellDirs` 与 `CellSources` 同索引增删，漏一个就会让扇形参数与源错位；
@@ -208,7 +228,7 @@ FFogOfWarExploredLayerProvider::Set(FFogOfWarGetExploredLayerDelegate::CreateUOb
 ## 线程模型
 
 - **游戏线程**：`UpdateSceneGpuVisionSources()` 收集清单 → 刷新已探索层 → `UploadFrameData_GameThread()` 加锁交换清单与参数快照、`UploadExploredLayer_GameThread()` 单独交已探索层（它的数据量比视野源大两三个数量级，不值得每帧搬）。游戏线程不碰任何图形资源。
-- **渲染线程**：`SubscribeToPostProcessingPass()` 取一份快照（多视口时同一帧会多次 Subscribe，因此是拷贝而不是交换），只有“本帧不该遮蔽”（雾总开关关闭 / 子系统不可用）或场几何未就绪时才不注入回调；回调里按 RDG 建缓冲与纹理并记录三趟 pass —— 本帧没有视野源时跳过上传与散射趟、只保留清零后的覆盖率场，于是整屏被判成“从未探索”而被遮蔽。RDG 的 `QueueBufferUpload` 会自己拷贝源数据，因此不存在跨帧生命周期问题。
+- **渲染线程**：`SubscribeToPostProcessingPass()` 取一份快照（多视口时同一帧会多次 Subscribe，因此是拷贝而不是交换），只有“本帧不该遮蔽”（雾总开关关闭 / 子系统不可用 / **观察队伍是观察者或管理员**，见上一节）或场几何未就绪时才不注入回调；回调里按 RDG 建缓冲与纹理并记录三趟 pass —— 本帧没有视野源时跳过上传与散射趟、只保留清零后的覆盖率场，于是整屏被判成“从未探索”而被遮蔽。RDG 的 `QueueBufferUpload` 会自己拷贝源数据，因此不存在跨帧生命周期问题。
 
 ## 已知取舍
 

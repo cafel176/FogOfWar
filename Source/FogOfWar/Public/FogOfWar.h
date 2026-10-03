@@ -135,6 +135,9 @@ public:
 	/// @brief 场景雾的 GPU 揭雾源总开关。关闭时本帧告诉渲染侧“不遮蔽”，连 pass 都不注入（雾消失）。
 	/// @note 与之相对：开关开着、但本帧一条视野源都没有时，画面是**整屏遮蔽**（什么都看不见），
 	///       而不是雾消失 —— 这两件事在渲染侧由独立的标志区分，见 UploadSceneGpuVisionSources 的说明。
+	/// @note 另有一条**按角色**而非按开关的"不遮蔽"：当前观察队伍是观察者（INDEX_NONE）或
+	///       管理员（127）时同样不画雾，且与本开关相互独立（见 UpdateSceneGpuVisionSources）。
+	///       所以"雾没画出来"有两个来源，排查时先确认是哪一个。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
 	bool bEnableSceneGpuVisionSources = true;
 
@@ -250,10 +253,18 @@ public:
 	 * @brief 收集本帧的场景雾视野源，并交给 FFogOfWarSceneViewExtension。
 	 * @details 只收集与当前观察队伍同队的单位视野。观察队伍由外部注册的提供者给出
 	 *          （FFogOfWarViewingTeamProvider，本工程里注册的是
-	 *          UMassBattleGlobalVarFunctionLibrary::GetTeam）；提供者未注册或返回
-	 *          INDEX_NONE 时退化为不按队伍过滤。
-	 *          收集不到（开关关闭 / 子系统缺失 / 世界正在销毁）时交出空清单，让渲染侧连
-	 *          pass 都不注入，雾直接消失而不是停在上一帧的旧圆盘上。
+	 *          UMassBattleGlobalVarFunctionLibrary::GetTeam）。
+	 *
+	 *          两条"本帧完全不遮蔽"（渲染侧连一次全屏 pass 都不注入，雾彻底消失）：
+	 *           ① 总开关关闭 / 子系统缺失 / 世界正在销毁 —— 收集不到任何源；
+	 *           ② 观察队伍是**观察者（INDEX_NONE）或管理员（127）** —— 这两个角色要能不受遮蔽地
+	 *              查看整张地图。注意"提供者未注册"也会得到 INDEX_NONE，因此同样落在这一支：
+	 *              无从判断"当前是谁在看"时，不遮蔽是更保守的一侧（后果至多是看不到雾，
+	 *              而不是把一个缺失的注册变成"把谁的视野糊掉"）；
+	 *
+	 *          与之相对，"雾该画、只是本帧一条视野源都没收到"（相机移出所有单位视野 / 源被视图
+	 *          剔除干净）走的是正常路径：渲染侧照常注入 pass、覆盖率场全 0，结果是**整屏遮蔽**。
+	 *          这三种结果在渲染侧由 bSceneFogActive 与"源数为 0"两个独立条件区分。
 	 */
 	void UpdateSceneGpuVisionSources();
 
