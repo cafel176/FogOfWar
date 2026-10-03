@@ -15,6 +15,9 @@
 /** 场景雾的渲染实现（定义在 Private/SceneFog 下）：世界空间视野场散射 + R8G8 打包 + 合成。 */
 class FFogOfWarSceneViewExtension;
 
+/** 视野场的持久载体（见 AFogOfWar::VisionFieldTexture）。 */
+class UTextureRenderTarget2D;
+
 /**
  * @struct FFogVisionSource
  * @brief CPU 侧一条视野源：揭雾中心（世界 XY）+ 生效半径（cm）+ 揭雾扇形（方向 + 半角余弦）。
@@ -98,6 +101,21 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FogOfWar")
 	bool IsActivated() const { return bActivated; }
 
+	/**
+	 * @brief 视野场的持久纹理（PF_R8G8：R = 当前视野覆盖率，G = 已探索）；未激活 / 尺寸未知时为 nullptr。
+	 * @details 供调试可视化与新对局自检用。**重要**：这张纹理在渲染线程被每帧写入，游戏线程直接
+	 *          采样它（例如建 MID 去读）会撞上未完成的写入 —— 要读它就必须回到渲染线程里读
+	 *          （合成趟就是这么做的）。
+	 */
+	UTextureRenderTarget2D* GetVisionFieldTexture() const { return VisionFieldTexture; }
+
+	/**
+	 * @brief Actor 结束时撤下向其余系统发布的状态。
+	 * @details 必须撤：消费方（Agent 渲染处理器 / 音频门控）每帧都读这个快照，Actor 没了却还留着
+	 *          "bEnabled = true"，它们就会继续按旧的可见性去遮敌人。
+	 */
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
 public:
 	//~ Begin UPROPERTY Configuration
 	
@@ -135,9 +153,9 @@ public:
 	/// @brief 场景雾的 GPU 揭雾源总开关。关闭时本帧告诉渲染侧“不遮蔽”，连 pass 都不注入（雾消失）。
 	/// @note 与之相对：开关开着、但本帧一条视野源都没有时，画面是**整屏遮蔽**（什么都看不见），
 	///       而不是雾消失 —— 这两件事在渲染侧由独立的标志区分，见 UploadSceneGpuVisionSources 的说明。
-	/// @note 另有一条**按角色**而非按开关的"不遮蔽"：当前观察队伍是观察者（INDEX_NONE）或
-	///       管理员（127）时同样不画雾，且与本开关相互独立（见 UpdateSceneGpuVisionSources）。
-	///       所以"雾没画出来"有两个来源，排查时先确认是哪一个。
+	/// @note 它只是**三道**"不画雾"闸门里的一道，另外两道（全局游戏状态不允许 / 观察者是观察者·管理员）
+	///       与本开关相互独立、各自成立（见 UpdateSceneGpuVisionSources 的说明）。
+	///       所以"雾没画出来"有三个来源，排查时先确认是哪一个 —— 每一道都会打一条一次性日志。
 	UPROPERTY(EditAnywhere, Category = "FogOfWar|Scene GPU")
 	bool bEnableSceneGpuVisionSources = true;
 
@@ -255,16 +273,25 @@ public:
 	 *          （FFogOfWarViewingTeamProvider，本工程里注册的是
 	 *          UMassBattleGlobalVarFunctionLibrary::GetTeam）。
 	 *
-	 *          两条"本帧完全不遮蔽"（渲染侧连一次全屏 pass 都不注入，雾彻底消失）：
-	 *           ① 总开关关闭 / 子系统缺失 / 世界正在销毁 —— 收集不到任何源；
-	 *           ② 观察队伍是**观察者（INDEX_NONE）或管理员（127）** —— 这两个角色要能不受遮蔽地
+	 *          三道"本帧完全不遮蔽"的闸门（渲染侧连一次全屏 pass 都不注入，雾彻底消失），
+	 *          都在视野源收集**之前**判定 —— 不画雾的帧连 HashGrid 都不遍历：
+	 *           ① **全局游戏状态不允许**：FFogOfWarCanDrawFogProvider（本工程注册的是
+	 *              UMassBattleGlobalVarFunctionLibrary::CanDrawFog —— 编辑场景 / 主菜单不画，
+	 *              模拟·训练·调试画）；
+	 *           ② **本插件总开关关闭 / Mass 子系统缺失 / 世界正在销毁**；
+	 *           ③ **观察队伍是观察者（INDEX_NONE）或管理员（127）** —— 这两个角色要能不受遮蔽地
 	 *              查看整张地图。注意"提供者未注册"也会得到 INDEX_NONE，因此同样落在这一支：
 	 *              无从判断"当前是谁在看"时，不遮蔽是更保守的一侧（后果至多是看不到雾，
-	 *              而不是把一个缺失的注册变成"把谁的视野糊掉"）；
+	 *              而不是把一个缺失的注册变成"把谁的视野糊掉"）。
+	 *
+	 *          三道闸门共用一个出口：除了告诉渲染侧"不遮蔽"，它**还必须撤掉状态发布**
+	 *          （FMassBattleFogVisionField::bEnabled = false）—— 否则消费方（Agent 渲染处理器的
+	 *          敌方网格遮蔽、音频门控）会继续按上一帧的快照遮住敌人。新增"不画雾"的分支时必须走
+	 *          那个出口，不能各自 return。
 	 *
 	 *          与之相对，"雾该画、只是本帧一条视野源都没收到"（相机移出所有单位视野 / 源被视图
 	 *          剔除干净）走的是正常路径：渲染侧照常注入 pass、覆盖率场全 0，结果是**整屏遮蔽**。
-	 *          这三种结果在渲染侧由 bSceneFogActive 与"源数为 0"两个独立条件区分。
+	 *          这些结果在渲染侧由 bSceneFogActive 与"源数为 0"两个独立条件区分。
 	 */
 	void UpdateSceneGpuVisionSources();
 
@@ -317,6 +344,30 @@ public:
 	UPROPERTY(VisibleInstanceOnly)
 	FVector2D GridBottomLeftWorldLocation = FVector2D::Zero();
 
+	/**
+	 * @brief 视野场的**持久**纹理（PF_R8G8：R = 当前视野覆盖率，G = 已探索）—— 对外唯一的视野场出口。
+	 *
+	 * @details 为什么需要它：这张场必须**跨帧存在** —— G 通道（已探索）是累积出来的历史，
+	 *          R 通道（当前覆盖率）也只是每帧被增量更新，都出不了那一帧的 RDG 瞬态资源。
+	 *          所以打包趟**直接写进这张持久 RT**（RDG 用 RegisterExternalTexture 挂在它上面），
+	 *          合成趟再把它当外部纹理读回来。
+	 *
+	 * @details 尺寸随视野场几何变化（换图 / 场分辨率变化）时重建；内容会被**清成 R = 255（全可见）**，
+	 *          这是刻意的安全默认：万一在第一次打包之前就被读取，得到的是"什么都能看见"，
+	 *          而不是"全部被遮蔽"。见 EnsureVisionFieldTexture。
+	 *
+	 * @note 这张纹理**只在 GPU 上**，游戏线程读不到（回读等于每帧同步）。因此"敌方该不该画"
+	 *       不走它，而是走每帧发布的视野源集：见 FMassBattleVisionSourceSet 与
+	 *       MassBattleAgentRenderProcessor 的 ShouldHideAgentByFog。
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UTextureRenderTarget2D> VisionFieldTexture = nullptr;
+
+	/// @brief VisionFieldTexture 当前对应的场分辨率（0 = 还没有纹理）。
+	/// @details 自己记着尺寸，而不是每帧去问纹理 —— 重建判据必须能在"不该重建"这一侧做到零 API 调用：
+	///          本函数每帧都会走一次，稳态下只应是一次整数比较。
+	FIntPoint VisionFieldTexelCount = FIntPoint::ZeroValue;
+
 	/// @brief 场景雾的渲染实现。Activate 时注册进引擎，成员释放即反注册。
 	TSharedPtr<FFogOfWarSceneViewExtension, ESPMode::ThreadSafe> SceneFogViewExtension;
 
@@ -324,6 +375,14 @@ public:
 	/// @details 每帧 Reset（保留容量）后 Add，Num 即本帧源数；交给渲染线程时整个数组被交换走，
 	///          下一帧换回上一帧的缓冲继续复用，因此稳态下不产生分配。
 	TArray<FVector4f> SceneGpuVisionSources;
+
+	/// @brief 同一批视野源的 CPU 版本：圆 (CenterX, CenterY, 真实视距 cm) 与扇形 (ForwardX, ForwardY, cos 半角)。
+	/// @details 与 SceneGpuVisionSources 同源同序，但用**未加余量**的视距、且收集于视图剔除之前；
+	///          每帧随快照一起发布给 MassBattle 的视野源查询集（见 FMassBattleVisionSourceSet）。
+	///          之所以用 `FVector4f` 而不是那边的结构体：**本头文件是公开头**，不应依赖 MassBattle
+	///          的类型（它对本插件是私有依赖）—— 发布时在 .cpp 里按两条数组转交。
+	TArray<FVector4f> CpuVisionSourceCircles;
+	TArray<FVector4f> CpuVisionSourceDirs;
 
 	/// @brief 与 SceneGpuVisionSources **一一对应**的扇形参数：(dirX, dirY, cosHalfAngle, 0)。
 	/// @details cosHalfAngle >= 1 表示"全向"（着色器据此跳过扇形判定）；否则像素相对源中心的方向与
@@ -354,6 +413,19 @@ public:
 	 *            → 渲染侧照常注入 pass，覆盖率场全 0，整屏按"从未探索"遮蔽 —— 这才是"什么
 	 *            都看不见"应有的画面，而不是让迷雾凭空消失。
 	 */
+	/**
+	 * @brief 确保 VisionFieldTexture 与给定场分辨率一致（不一致才重建，内容清成 R = 255 全可见）。
+	 *
+	 * @details 重建是**换图级别**的事件（场分辨率由地图矩形与 VisionFieldTexelSizeCm 派生，稳态不变），
+	 *          所以这里可以承受一次 FlushRenderingCommands —— 它保证渲染线程不再持有旧纹理，
+	 *          否则释放旧 RHI 资源时可能正被上一帧的 RDG 用着。
+	 *
+	 * @details 为什么清成"全可见"而不是全黑：内容为 0 的语义是"哪里都不可见"，一旦消费方在打包趟
+	 *          写出第一帧之前就开始采样（例如首帧的渲染顺序差），全黑会让**整场敌人与特效消失**。
+	 *          全可见则是"遮蔽功能暂时不生效"，是同一个错误里唯一无害的那一侧。
+	 */
+	void EnsureVisionFieldTexture(FIntPoint InTexelCount);
+
 	void UploadSceneGpuVisionSources(bool bSceneFogActive);
 
 	int32 SceneGpuVisionPerfSampleCount = 0;

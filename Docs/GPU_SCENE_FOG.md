@@ -141,19 +141,43 @@ SceneGpuVisionPerformanceLogInterval       统计周期（秒）
 ## 什么时候完全不画雾
 
 `bSceneFogActive = false` 的帧，渲染侧连一次全屏 pass 都不注入 —— 画面就是场景本身，没有雾。
-它与"雾开着但本帧一条视野源都没收到"（覆盖率场全 0 → **整屏遮蔽**）是两种不同语义，别混。产生前者有两条路径：
+它与"雾开着但本帧一条视野源都没收到"（覆盖率场全 0 → **整屏遮蔽**）是两种不同语义，别混。
+产生前者有三道闸门，都在视野源收集**之前**判定（不画雾的帧连 HashGrid 都不遍历，成本为零）：
 
-1. `bEnableSceneGpuVisionSources` 关闭 / Mass 子系统缺失 / 世界正在销毁 —— 原因是"雾系统不可用"；
-2. **当前观察队伍是观察者（`INDEX_NONE`）或管理员（127）** —— 原因是"看的人要看整张地图"。
-   这两个角色是队伍面板上的两个按钮（`UTeamPanelWidgetBase`），用途正是"不受遮蔽地查看全局"。
+| # | 闸门 | 触发条件 | 语义 |
+| --- | --- | --- | --- |
+| 1 | `FFogOfWarCanDrawFogProvider` | 注册方判定"现在不该画雾" | 业务侧按**全局游戏状态**给出的裁决 |
+| 2 | `bEnableSceneGpuVisionSources` | 开关关闭 / Mass 子系统缺失 / 世界正在销毁 | 本插件自己的总开关（"这次不用它"） |
+| 3 | `FFogOfWarViewingTeamProvider` | 观察者是 `INDEX_NONE`（观察者）或 `127`（管理员） | 看的人要看整张地图 |
 
-第 2 条与总开关**相互独立**，且排在视野源收集**之前**：观察整张地图期间根本不去遍历 HashGrid，
-所以观察者模式下雾的成本是零（而不是"采集完再丢掉"）。
+闸门 1 的实现是本工程的 `UMassBattleGlobalVarFunctionLibrary::CanDrawFog()` ——
+按 `EGlobalGameState` 判定：**编辑场景与主菜单不画，模拟 / 训练 / 调试画**。
+由于依赖方向（`MassBattleSystem → MassBattleMap → FogOfWar`）不允许本插件反向调用它，
+它和闸门 2 一样经提供者注册进来（注册点：`FMassBattleSystemModule::StartupModule`）。
 
-一个刻意的取舍：观察队伍提供者（`FFogOfWarViewingTeamProvider`）**未注册**时，查询同样返回
-`INDEX_NONE`，于是也走第 2 条、不画雾。本插件无从判断"当前是谁在看"，此时不遮蔽是更保守的一侧 ——
-后果至多是"看不到雾"，而不是"一个缺失的注册把谁的视野糊掉"。这种情况会打一条一次性日志
-（`LogFogOfWar`），把两种成因都写出来，免得日后把"没注册"误当成"观察者模式生效了"。
+三道闸门都汇入**同一个出口** `SkipFogThisFrame()`，它做两件事，缺一不可：
+
+1. 告诉渲染侧"不遮蔽"（`bSceneFogActive = false` → 连一次全屏 pass 都不注入）；
+2. **撤掉视野场的发布**（`FMassBattleFogVisionField::bEnabled = false`）。
+
+第 2 件容易被忽略：消费方（Agent/FX 渲染器的可见性裁剪、音频门控）手里握着的是**上一帧的快照**，
+只做第 1 件会留下"画面上没有雾、敌人却依然被遮住或被静音"的半生效状态。这也正是
+`FMassBattleFogVisionField::bEnabled` 存在的理由 —— 所以每一条"不画雾"的出口都必须经过它，
+不能再各自散落地 `return`。
+
+两处刻意的退化取向（都是"缺信息 → 不遮蔽"）：
+
+- 观察队伍提供者未注册时返回 `INDEX_NONE`，于是走闸门 3、不画雾。本插件无从判断"当前是谁在看"，
+  不遮蔽是更保守的一侧 —— 后果至多是"看不到雾"，而不是"一个缺失的注册把谁的视野糊掉"。
+- `CanDrawFog` 提供者未注册时按**允许**处理（插件独立使用时的默认行为就是画雾）；
+  且 `CanDrawFog()` 自身在全局变量子系统不可用时返回 false，此时同样不画。
+
+两种情况各打一条一次性日志（`LogFogOfWar`），把成因写出来，免得日后把"没注册"误当成"某个模式生效了"。
+
+@note 这道闸门只关**表现**（雾、敌人遮蔽、敌方声音），**不关数据**：CPU 侧的逐队探索层
+（`CollectVisionSourcesByTeam` → 已探索/可见层 → RL 观测的 `explored_percent` / `bVisible`）
+照常累积。它不是"画出来的东西"，而是逻辑与观测的输入，编辑场景里也没有它的消费者。
+（同理，观察者/管理员模式也不影响探索层 —— 见 `RefreshExploredFromFogOfWar` 的说明。）
 
 
 **揭雾形状不在这张表里** —— 它是逐单位的数据，不是全局开关，来源只有一条链：
@@ -241,6 +265,127 @@ FFogOfWarExploredLayerProvider::Set(FFogOfWarGetExploredLayerDelegate::CreateUOb
 - **扇形依赖 `FRotating`**：朝向缺失（实体没有该 fragment）或方向为零向量时退化为全向。也就是说**定点炮台这类不写朝向的实体拿不到扇形**，只能拿到整圈视野；需要它按朝向揭雾时，得让它有一个有效的 `FRotating::Direction`。
 - **作用范围**：注册的是世界作用域的扩展，因此该世界的**所有视图**都会走这三趟 pass（包括编辑器视口与 SceneCapture）。旧的 `UPostProcessComponent` 已经删除，不再有 `BlendRadius/BlendWeight` 这种“局部生效”的语义。
 - **平台**：`ShouldCompilePermutation` 限定 SM5。依赖三件事：`PF_R32_UINT` 的 UAV 与 `InterlockedMax`、`PF_R8G8` 渲染目标、compute dispatch 的 Z 维（源数上限受 `GRHIMaxDispatchThreadGroupsPerDimension.Z` 约束，`MaxSceneGpuVisionSources` 的默认值远低于它）。
+
+## 迷雾遮蔽敌方实体（可见性裁剪）
+
+RTS 视角下敌方单位即使站在迷雾里也会被画出来 —— 因为渲染与战争迷雾本来就是两套互不知情的数据。
+这一节说明现在怎么把它们接起来：**画面上的雾由合成趟画（GPU 侧，见前文三趟 pass），
+"敌方网格该不该画"由 CPU 侧的渲染批次决定**。
+
+### 数据流
+
+```text
+AFogOfWar::Tick（每帧）
+  ├─ 收集本队视野源 → 上传给场景雾扩展 → 三趟 pass 画雾（与"该不该画敌人"无关）
+  └─ 同一批源也发布给 CPU：SetVisionSources(...)（构建只读查询集）＋ Set(bEnabled = 本帧是否真要画雾)
+                                    ↓
+MassBattleAgentRenderProcessor::Execute（每帧、逐实体）
+  └─ ShouldHideAgentByFog(位置, 队伍)：敌方 且 !FogVisionSources->IsWorldVisible(位置) → IsHiddenArray[i]
+                                    ↓
+AMassBattleAgentRenderer::Tick（每帧、每批一次）
+  └─ SetNiagaraArrayBool("IsHidden_Array", IsHiddenArray)
+                                    ↓
+MassBattle_AgentMeshPrediction.ush → OutMeshVisible = !InIsHidden
+
+MassBattleFxRenderProcessor::Execute（每帧、**串行**段，在推送之前）
+  └─ 对"当前占用"的槽位按位置查可见性 → IsHiddenArray_Attached[slot]
+  └─ SetNiagaraArrayBool("IsHiddenArray_Attached", …)（HostMono 的 CPU 插值批次推的是同一个数组）
+                                    ↓
+MassBattle_FxPrediction.ush → OutVisible = !InIsHidden
+```
+
+关键点：
+
+- **走的是本来就存在的通道**（`IsHidden_Array` → `InIsHidden` → `OutMeshVisible`，池化/休眠一直在用它），
+  所以**零资产改动**：不需要给 Niagara 加引脚、不需要给 `.ush` 加参数、不需要动任何资产。
+- **只改可见性**：渲染批次数组与 sim 状态本来就是解耦的，被遮住的实体照常被处理器更新、照常参与
+  移动/物理/命中/AI —— "迷雾只遮画面、不遮行为"是这套架构自带的，不是需要额外保证的东西。
+- **队伍来自 CPU**：每实例的 `FTeam::index` 就在处理器手里，不需要经过打包进 `DynamicParams0.w`
+  的那 8 位再解一次。
+
+### 为什么不采样视野场纹理（曾经的方案）
+
+曾经的做法是让 Niagara 在 shader 里采样视野场纹理（R8G8），好处是遮蔽边界与画面上的雾**逐像素重合**。
+这条路在引擎层走不通，相关代码已全部删除：
+
+- Niagara 的纹理是 **DataInterface**，不是 `Texture2D` 值 —— 不能当普通实参传给 `.ush` 的形参；
+- 把它做成 Custom HLSL 节点的 DI 输入引脚也不行：`ProcessCustomHlsl` 要求 DI"已在编译数据里注册"
+  （即经参数图 / DI 函数调用传进来），否则带着"签名作废"直接 `return`，调用方随即报
+  `Incorrect number of outputs`，下游每个 `Set` 节点跟着报错；
+- 想用 `User.FogVisionField` 这类命名空间读法同样不行：那段替换被参数图引脚门着，而那个模块的
+  34 个引脚**全是普通值类型**，没有参数图引脚 → token 被替换成空串（`'User' undeclared`）。
+
+结论：**那个模块的新输入只能是普通值类型**。要恢复"逐像素对齐"必须把判定拆开（资产里用 DI 的
+函数形态采样、把采样结果当普通值传进来），代价是判据一半在资产、一半在 `.ush`。
+
+### ⚠ 为什么不用 CPU 可见层位图（踩过的坑）
+
+最初的实现用 `IsWorldVisibleForTeam`（地图子系统的"当前可见层"位图），结果**完全不生效**：
+那张位图全工程**只有一个驱动点** —— RL 观测（`MassBattleSystemSubsystem::SpawnObservation`，
+每个 RL 步一次、每次光栅化约 60ms，见那里的注释"全工程唯一驱动这两层的调用点"）。
+PIE 里手动玩 / 不跑 RL 循环时它从未被光栅化，`HasVisibleLayer()` 为假、查询一律返回"可见"，
+于是遮蔽一次都没发生；而画面上的雾是 GPU 每帧算的 —— 症状就是"雾在、敌人却还站着"。
+
+现在改用**每帧都在收集**的那份视野源清单（GPU 揭雾的同一批源、同一份形状规则）做点查询：
+
+- 半径用**未加余量的真实视距**（`SightRadiusCm`）：画面上雾的覆盖率含 300cm 余量，因此存在一条
+  "雾已画出来、敌人已消失"的灰带 —— 方向安全（多遮而不是漏遮）。
+- 查询集每帧重建一次（按 X 排序 + 半径窗口，6000 条源约 0.2ms），构建完只读，可被并行循环无锁共享。
+- 与位图那条路相比，差别是**没有刷新周期滞后**，也不依赖 RL 是否在跑。
+
+失效方向仍然安全：源集未发布 / 迷雾本帧未生效时一律按"不遮蔽"处理 —— 最坏是"多画了"，
+而不是把整场敌人抹掉。
+
+### 性能
+
+| 项 | 成本 |
+| --- | --- |
+| CPU（每帧） | 单位：逐实体 1 次 O(1) 位查询 + 1 次比较，**只对敌方做**（同队直接跳过，不打任何查询）；特效：每个**占用**槽位 1 次位查询（串行段，在推送之前） |
+| GPU | **零额外成本**：只是某个实例的 `IsHiddenArray` 由 false 变 true，Niagara 照常跑，`OutMeshVisible` 为假时不画 |
+| 额外带宽 | 无：`IsHidden_Array` 本来每帧就在推 |
+| 音频（每帧） | 每条在播声音 1 次 O(1) 位测试 + 1 次 `SetVolumeMultiplier`（几十条量级） |
+
+万级单位下每帧多的是"1 万次位测试"，相对批次装配、动画解码、混音都可以忽略。
+这条路刻意避开的正是最贵的那件事：逐帧在 CPU 上重算可见层（60ms/次）—— 我们只**查**它，不重算它。
+
+### 已知边界
+
+- **无刷新滞后**：网格遮蔽与音频静音都与画面上的雾用**同一帧**的视野源，逐帧一致，
+  且都不再依赖 RL 是否在跑。那条"查地图可见层位图"的注册与查询已随本次改造删除
+  （`FMassBattleTeamVisibilityProvider` 现在只提供"当前观察队伍"）。
+- **没有 300cm 提前量**：遮蔽边界跟真实视距走，而画面上雾的边界含 300cm 余量 —— 于是存在一条
+  "雾已经画出来、敌人也已经被遮住"的灰带。方向上安全（多遮而不是漏遮）。
+- **只裁敌方，不裁己方**：在 C++ 里比较 `FTeam::index` 与观察队伍，同队直接跳过判定 ——
+  所以"我的部队会不会消失"不依赖任何视野数据是否正确。
+- **FX 只能按位置裁（没有队伍）**：特效实体不带 `FTeam`，而 FX 的逐实体循环与推送段都是**并行**的，
+  从工作线程回查地图子系统的可见层不安全 —— 所以 FX 的遮蔽放在 `MassBattleFxRenderProcessor` 的
+  **串行**推送段，只按位置判。己方特效通常就在己方视野内不受影响，但**远端的己方特效理论上会被误遮**。
+  要按队伍隔离，得把发起者队伍带进 FX 批次（`FFxVisualizing::ParentEntity` 已经指回发起者，
+  但它只能在游戏线程上查）。
+- **音频只覆盖"被插值的声音"**：门控挂在 `UpdateHostRenderInterp` 的逐帧声音循环里，因此只作用于
+  **附着型**（`bAttached`）声音宿主；一次性的 3D 音效（例如远处爆炸）走另一条路，目前不受遮蔽。
+  要覆盖它需要另加一条逐帧遍历（`FSoundConfig_Final` 上的 fragment query）。
+- **多视口**：外部 RT 每帧只被**第一个**视口写一次（同一张 RDG 纹理不能无序写两次）。视野源本来就会
+  按视口做视图剔除，因此分屏下发布的场对应"最先渲染的那个视口"。要消除这一点，把
+  `bCullVisionSourcesOutOfView` 关掉即可 —— 场与相机无关，关掉之后各视口算出的场完全一致。
+
+### 已移除的尝试（不要再走）
+
+为实现"逐像素对齐的网格遮蔽"，曾经写过一整条 Niagara 链路（着色器采样视野场纹理）。它在引擎层
+走不通，相关代码已全部删除，留此备查：
+
+| 删掉的东西 | 为什么 |
+| --- | --- |
+| `MassBattle_AgentMeshPrediction.ush` / `MassBattle_FxPrediction.ush` 里的 `MassBattle_FogVisibility` 与"迷雾参数重载" | 没有任何资产能把纹理喂进去（DI 进不了 Custom HLSL 模块），永远是死代码 |
+| `FMassBattleFogVisionFieldProvider` 的 `Texture / WorldToUV / ViewingTeam / IsUsable / GetNiagara*ParamName / ApplyToNiagaraComponent` | 只服务那条死链路 |
+| `AMassBattleAgentRenderer::Tick` / `AMassBattleFxRenderer::Tick` 里的 `SetVariableTexture…` / `SetVariableVec4` / `SetVariableFloat` 推送 | 同上 |
+
+`FMassBattleFogVisionField` 现在只剩一个字段 `bEnabled`（本帧迷雾是否生效），消费方是
+`MassBattleHostSubsystem`（敌方声音静音）与 `MassBattleAgentRenderProcessor`（敌方网格遮蔽）——
+两者必须同源，否则会出现"声音被遮了、敌人却还站着"这类半生效状态。
+
+验证：站己方视角把相机移到己方视野之外，**敌方**单位与它打出的特效应当消失，**己方完全不受影响**；
+切观察者/管理员，雾与遮蔽**同时**消失（`bEnabled=false` 那条路）；切回来两者同时恢复。
 
 ## 测量
 

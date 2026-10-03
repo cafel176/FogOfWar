@@ -4,8 +4,12 @@
 
 #include "CommonRenderResources.h"
 #include "DynamicRHI.h"
+// UTextureRenderTarget2D：视野场的持久载体（打包趟直接写进它）。
+#include "Engine/TextureRenderTarget2D.h"
 #include "FogOfWar.h"
 #include "GlobalShader.h"
+// CreateRenderTarget：把 UTextureRenderTarget2D 的 RHI 纹理包装成 RDG 可注册的外部纹理。
+#include "PooledRenderTarget.h"
 #include "Math/IntVector.h"
 #include "PipelineStateCache.h"
 #include "PixelShaderUtils.h"
@@ -253,7 +257,8 @@ void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
 	TArray<FVector4f>& InOutSourceDirs,
 	const FFogOfWarSceneFogSettings& InSettings,
 	const FFogOfWarSceneVisionField& InField,
-	bool bInSceneFogActive)
+	bool bInSceneFogActive,
+	UTextureRenderTarget2D* InFieldTexture)
 {
 	check(IsInGameThread());
 
@@ -268,6 +273,7 @@ void FFogOfWarSceneViewExtension::UploadFrameData_GameThread(
 	PendingSettings = InSettings;
 	PendingField = InField;
 	PendingSceneFogActive = bInSceneFogActive;
+	PendingFieldTexture = InFieldTexture;
 }
 
 void FFogOfWarSceneViewExtension::UploadExploredLayer_GameThread(const FFogOfWarSceneExploredLayer& InExploredLayer)
@@ -301,6 +307,7 @@ void FFogOfWarSceneViewExtension::SubscribeToPostProcessingPass(
 		RenderThreadSettings = PendingSettings;
 		RenderThreadField = PendingField;
 		RenderThreadSceneFogActive = PendingSceneFogActive;
+		RenderThreadFieldTexture = PendingFieldTexture;
 
 		// 已探索层只在内容真的变化时拷贝：它是逐格位图，比视野源大两三个数量级，
 		// 而探索层每秒只变几次。同一帧的第二个视口因为版本号已经对齐，同样会跳过。
@@ -502,11 +509,53 @@ FScreenPassTexture FFogOfWarSceneViewExtension::PostProcess_RenderThread(
 
 	// ---- 趟 2：打包。整数覆盖率 + 已探索 → PF_R8G8（R = 当前覆盖率，G = 已探索）----
 	// 两通道放进同一张纹理，合成趟一次采样就能同时拿到"现在能不能看见"与"以前有没有看见过"。
-	FRDGTextureRef VisionFieldTexture = GraphBuilder.CreateTexture(
-		FRDGTextureDesc::Create2D(
-			FieldExtent, PF_R8G8, FClearValueBinding::Black,
-			TexCreate_RenderTargetable | TexCreate_ShaderResource),
-		TEXT("FogOfWar.VisionField"));
+	//
+	// 输出目标有两种，取决于"本帧要不要把场对外发布"（多视口时只有第一个视口发布，见
+	// LastFieldPublishFamily 的说明）：
+	//   · 发布（正常情况）：**直接写进 Actor 持有的持久 RT** —— 屏幕上的雾与"迷雾遮蔽敌方单位"
+	//     因此用的是同一份像素数据，遮蔽边界与雾边界逐像素重合，而且不是拷贝（零额外带宽）；
+	//   · 不发布（同帧的第二个视口 / 没有可用的 RT）：退回一张瞬态场，雾照画，只是不对外发布。
+	FRDGTextureRef VisionFieldTexture = nullptr;
+	{
+		bool bPublishToExternal = false;
+		if (UTextureRenderTarget2D* FieldRT = RenderThreadFieldTexture.Get())
+		{
+			const FSceneViewFamily* Family = View.Family;
+			const uint64 FrameNumber = Family ? Family->FrameNumber : 0;
+			// 同一个 (Family, Frame) 只发布一次：多视口共用这一张外部纹理，写两次就是同一张
+			// RDG 纹理上的无序写。
+			const bool bAlreadyPublishedThisFrame =
+				(LastFieldPublishFamily == Family) && (LastFieldPublishFrameNumber == FrameNumber);
+
+			if (!bAlreadyPublishedThisFrame)
+			{
+				if (FTextureRenderTargetResource* RTResource = FieldRT->GetRenderTargetResource())
+				{
+					// CreateRenderTarget + RegisterExternalTexture：把 UObject 侧已有的 RHI 纹理交给 RDG
+					// 管理状态转换。这正是引擎自己往 UTextureRenderTarget2D 里写数据的写法
+					//（FTextureRenderTarget2DResource::UpdateDeferredResource 里就是这一句）。
+					VisionFieldTexture = GraphBuilder.RegisterExternalTexture(
+						CreateRenderTarget(RTResource->GetShaderResourceTexture(), TEXT("FogOfWar.VisionFieldExternal")));
+					bPublishToExternal = true;
+				}
+			}
+
+			if (bPublishToExternal)
+			{
+				LastFieldPublishFamily = Family;
+				LastFieldPublishFrameNumber = FrameNumber;
+			}
+		}
+
+		if (!VisionFieldTexture)
+		{
+			VisionFieldTexture = GraphBuilder.CreateTexture(
+				FRDGTextureDesc::Create2D(
+					FieldExtent, PF_R8G8, FClearValueBinding::Black,
+					TexCreate_RenderTargetable | TexCreate_ShaderResource),
+				TEXT("FogOfWar.VisionField"));
+		}
+	}
 
 	auto* PackParameters = GraphBuilder.AllocParameters<FFogOfWarSceneVisionFieldPackPS::FParameters>();
 	// 整张场都会被写满，因此不需要保留上一帧内容。

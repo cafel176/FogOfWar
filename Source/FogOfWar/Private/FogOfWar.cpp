@@ -2,11 +2,15 @@
 
 #include "FogOfWar.h"
 
+#include "FogOfWarCanDrawFogProvider.h"
 #include "FogOfWarExploredLayerProvider.h"
 #include "FogOfWarMassBinding.h"
 #include "Camera/CameraTypes.h"
 #include "Camera/PlayerCameraManager.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
+// 视野场对外发布的通道（声明在 MassBattle 里，因为它是依赖链的最底层，见该头文件说明）。
+#include "Fog/MassBattleFogVisibilityProvider.h"
 #include "GameFramework/PlayerController.h"
 #include "MassEntitySubsystem.h"
 #include "SceneFog/FogOfWarSceneViewExtension.h"
@@ -462,8 +466,49 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 {
 	const double TotalStartTime = FPlatformTime::Seconds();
 
+	// "本帧不画雾"的**唯一**出口 —— 两件事必须一起做，所以它们只能有一个出口：
+	//  ① 告诉渲染侧"不遮蔽"（bSceneFogActive = false → 连一次全屏 pass 都不注入）；
+	//  ② **撤掉视野场的发布**（FMassBattleFogVisionField::bEnabled = false）。
+	// 第 ② 件容易被忽略但同样重要：消费方（Agent/FX 渲染器、音频门控）手里握着的是上一帧的快照，
+	// 只做 ① 会留下"画面上没有雾、敌人却依然被遮住或被静音"这种半生效状态。
+	// 因此下面每一条"不画雾"的分支都必须经这里返回，不能再各自散落地 return。
+	auto SkipFogThisFrame = [this]()
+	{
+		// 顺序有意：先撤发布。下面的 UploadSceneGpuVisionSources 在"扩展不可用"时会直接返回、
+		// 连发布都不会做 —— 而"渲染扩展不在"恰恰是最需要把上一帧的启用快照撤掉的情形之一。
+		// 正常路径上这里会发布两次（这次 + Upload 内那次），幂等，代价只有一次结构体赋值。
+		FMassBattleFogVisionFieldProvider::Set(FMassBattleFogVisionField());   // bEnabled = false
+		FMassBattleFogVisionFieldProvider::ClearVisionSources();              // 本帧没有源，消费方一律不遮蔽
+		UploadSceneGpuVisionSources(/*bSceneFogActive=*/false);
+	};
+
 	if (!SceneFogViewExtension.IsValid())
 	{
+		// 扩展不在（未 Activate / 已销毁）：雾本来就不会画，但视野场同样要撤 ——
+		// 否则上一帧留下的"已启用"快照会继续遮住敌人。
+		SkipFogThisFrame();
+		return;
+	}
+
+	// ---- 闸门 1：业务侧按全局游戏状态给出的裁决 ----
+	// 来源 UMassBattleGlobalVarFunctionLibrary::CanDrawFog（经 FFogOfWarCanDrawFogProvider 注册进来）：
+	// 编辑场景与主菜单不画，模拟 / 训练 / 调试画。它与本 Actor 的总开关是**与**的关系，语义不同 ——
+	// 那个是"我这次不想用这个插件"，这个是"现在这个状态下不该有雾"。
+	//
+	// 放在收集之前：不画雾的帧连 HashGrid 都不用遍历，雾是零成本（编辑场景里尤其重要 ——
+	// 那里既没有迷雾需求，也不该为它每帧扫全图）。
+	if (!FFogOfWarCanDrawFogProvider::CanDrawFog())
+	{
+		static bool bLoggedFogDisabledByGameState = false;
+		if (!bLoggedFogDisabledByGameState)
+		{
+			bLoggedFogDisabledByGameState = true;
+			UE_LOG(LogFogOfWar, Log,
+				TEXT("场景雾已按全局游戏状态关闭：CanDrawFog() 返回 false（编辑场景 / 主菜单 / 全局变量子系统不可用）。")
+				TEXT("切到模拟·训练·调试状态后会自动恢复。"));
+		}
+
+		SkipFogThisFrame();
 		return;
 	}
 
@@ -472,21 +517,24 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	// 本帧的视野源清单：Reset 保留容量，Add 到 Num == 实际条数。交给渲染线程之后，下一帧会换回
 	// 上一帧用过的缓冲，因此稳态下这里不产生任何分配。
 	SceneGpuVisionSources.Reset();
+	CpuVisionSourceCircles.Reset();
+	CpuVisionSourceDirs.Reset();
 	SceneGpuVisionSourceDirs.Reset();
 
 	int32 VisitedCells = 0;
 	int32 VisitedAgents = 0;
 
+	// ---- 闸门 2：本插件总开关 + Mass 子系统可用性（World 为空即总开关关闭）----
 	UWorld* World = bEnableSceneGpuVisionSources ? GetWorld() : nullptr;
 	UMassEntitySubsystem* EntitySubsystem = World ? World->GetSubsystem<UMassEntitySubsystem>() : nullptr;
 	UMassBattleHashGridSubsystem* HashGrid = World ? World->GetSubsystem<UMassBattleHashGridSubsystem>() : nullptr;
 	if (!EntitySubsystem || !HashGrid)
 	{
-		// 雾系统不可用（开关关闭 / 子系统缺失 / 世界正在销毁）：告诉渲染侧"本帧不遮蔽"，画面完全不受
+		// 雾系统不可用（总开关关闭 / 子系统缺失 / 世界正在销毁）：告诉渲染侧"本帧不遮蔽"，画面完全不受
 		// 迷雾影响，而不是停在上一帧的旧圆盘上。
 		// 注意这与"有雾、但本帧一条源都没收到"是两种不同语义：后者走下面的正常路径
 		// （bSceneFogActive = true），由"覆盖率场全 0"表达成整屏遮蔽 —— 那才是正确的画面。
-		UploadSceneGpuVisionSources(/*bSceneFogActive=*/false);
+		SkipFogThisFrame();
 		return;
 	}
 
@@ -497,7 +545,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	// 提供者未注册、或注册方返回负值时，这里都得到 INDEX_NONE。
 	const int32 ViewingTeamIndex = FFogOfWarViewingTeamProvider::GetViewingTeam(this);
 
-	// 观察者（INDEX_NONE）/ 管理员（127）：**完全不画雾**。
+	// ---- 闸门 3：观察者（INDEX_NONE）/ 管理员（127）：完全不画雾 ----
 	// 这两个角色要能不受遮蔽地查看整张地图，这正是队伍面板上那两个按钮的用途；传 false 时渲染侧
 	// 连一次全屏 pass 都不注入（见 FFogOfWarSceneViewExtension::UploadFrameData_GameThread 的 ①），
 	// 与"雾开着、只是本帧一条视野源都没收到"那种**整屏遮蔽**是两种不同语义，不能混为一谈。
@@ -519,7 +567,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 				TEXT("若这不是预期行为，先确认观察队伍提供者已注册 —— 未注册时本查询同样返回 INDEX_NONE。"));
 		}
 
-		UploadSceneGpuVisionSources(/*bSceneFogActive=*/false);
+		SkipFogThisFrame();
 		return;
 	}
 
@@ -565,6 +613,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 			// 队伍过滤直接用 ViewingTeamIndex：走到这里它必定是一个具体队伍（观察者/管理员已在函数
 			// 开头返回，不会收集任何源），因此不存在"按 INDEX_NONE 过滤 = 不过滤"那种歧义。
 			float UploadRadius = 0.0f;
+			float SightRadiusCm = 0.0f;
 			// 扇形参数与半径在同一次判定里取回：朝向碎片的读取与"要不要读"的决策都收在
 			// TryGetVisionSourceRadius 内部，这里不再单独查一次碎片（见该函数的参数说明）。
 			FVector2D SectorForward(1.0, 0.0);
@@ -576,7 +625,7 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 				SceneGpuVisionSourceRadiusPadding,
 				UploadRadius,
 				/*OutTeamIndex=*/nullptr,
-				/*OutSightRadiusCm=*/nullptr,
+				&SightRadiusCm,
 				&SectorForward,
 				&SectorHalfAngleCos))
 			{
@@ -584,6 +633,23 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 			}
 
 			const FVector WorldLocation = Cell.CellLocation + AgentData.GetRelativeLocation();
+
+			// 同一批源也发布给 CPU（MassBattle 的视野源查询集），供渲染/音频侧逐帧判"看不见就遮"。
+			//
+			// ① 用**未加余量的真实视距**（SightRadiusCm），与地图可见层的口径一致 —— 余量是给投影/抖动
+			//    留的缓冲，拿它判可见性等于凭空放大视野；
+			// ② 排在**视图剔除之前**：被剔除的源不可能影响任何输出像素（对 GPU 场而言），但对"某点在不在
+			//    视野内"这个问题它们依然有效，保留只会多判一点可见 —— 方向安全（宁可多画，不要凭空少画）；
+			// ③ 扇形参数直接复用同一次解析的结果：GPU 场与 CPU 判定用的是同一个形状，不会各判一套。
+			// 两条数组同长同序；全向源写 (0,0,2) 哨兵，与 GPU 缓冲里的约定逐字一致。
+			CpuVisionSourceCircles.Add(FVector4f(
+				static_cast<float>(WorldLocation.X), static_cast<float>(WorldLocation.Y),
+				SightRadiusCm, 0.0f));
+			CpuVisionSourceDirs.Add((SectorHalfAngleCos < 1.0f)
+				? FVector4f(
+					static_cast<float>(SectorForward.X), static_cast<float>(SectorForward.Y),
+					SectorHalfAngleCos, 0.0f)
+				: FVector4f(0.0f, 0.0f, 2.0f, 0.0f));
 
 			// 视图剔除。必须排在"上限截断"之前：若先截断，完全落在屏幕外的源会先占满
 			// MaxSceneGpuVisionSources 的名额，把屏幕内的源挤出去，画面直接丢视野。
@@ -699,6 +765,63 @@ void AFogOfWar::UpdateSceneGpuVisionSources()
 	}
 }
 
+void AFogOfWar::EnsureVisionFieldTexture(FIntPoint InTexelCount)
+{
+	if (InTexelCount.X <= 0 || InTexelCount.Y <= 0)
+	{
+		return;
+	}
+
+	// 稳态（地图没换、场分辨率没变）：一次整数比较就返回，不做任何资源操作。
+	if (VisionFieldTexture && VisionFieldTexelCount == InTexelCount)
+	{
+		return;
+	}
+
+	// 走到这里说明是换图 / 场分辨率变化级别的事件。释放旧纹理前必须先确认渲染线程已经放掉它：
+	// 上一帧的 RDG 可能正以"外部纹理"的形式引用着这张 RHI 资源（见 FFogOfWarSceneViewExtension
+	// 的 RegisterExternalTexture），直接换掉会让那次引用悬空。等一次渲染线程是可接受的代价 ——
+	// 这条路径在一次对局里只会走一两次，而不是每帧。
+	if (VisionFieldTexture)
+	{
+		FlushRenderingCommands();
+		VisionFieldTexture = nullptr;
+	}
+
+	UTextureRenderTarget2D* NewTexture = NewObject<UTextureRenderTarget2D>(this, TEXT("FogVisionField"));
+
+	// 显式指定 PF_R8G8 且**强制线性 gamma**：场里存的是"覆盖率 × 255"的原始整数，任何 sRGB
+	// 往返都会把它变成非线性值，遮蔽阈值就不再有几何意义（差 1 个字节的覆盖率会变成差几个百分点的半径）。
+	NewTexture->InitCustomFormat(
+		static_cast<uint32>(InTexelCount.X),
+		static_cast<uint32>(InTexelCount.Y),
+		PF_R8G8,
+		/*bInForceLinearGamma=*/true);
+	NewTexture->bAutoGenerateMips = false;
+	// 清成 R = 255（全可见）：见头文件里"为什么初始内容不是全黑"的说明 —— 全黑的语义是
+	// "哪里都不可见"，一旦消费方在打包趟写出第一帧之前就采样，整场敌人与特效会一次性消失。
+	NewTexture->ClearColor = FLinearColor(1.0f, 0.0f, 0.0f, 1.0f);
+	NewTexture->UpdateResourceImmediate(/*bClearRenderTarget=*/true);
+
+	VisionFieldTexture = NewTexture;
+	VisionFieldTexelCount = InTexelCount;
+
+	UE_LOG(LogFogOfWar, Log,
+		TEXT("视野场纹理已重建：%dx%d（PF_R8G8，初始内容为“全可见”，等待第一次打包趟写入）。"),
+		InTexelCount.X, InTexelCount.Y);
+}
+
+void AFogOfWar::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// 撤下视野场。消费方（Agent/FX 渲染器）手里握着的是弱引用 + 一组世界→UV 换算参数；
+	// 换图 / Actor 重建后若还留着旧的，消费方就会拿一张已经对不上地图的场去判断可见性 ——
+	// 表现为"敌人凭空消失一片"，而且不会有任何报错。
+	FMassBattleFogVisionFieldProvider::Reset();
+	FMassBattleFogVisionFieldProvider::ClearVisionSources();
+
+	Super::EndPlay(EndPlayReason);
+}
+
 void AFogOfWar::UploadSceneGpuVisionSources(bool bSceneFogActive)
 {
 	if (!SceneFogViewExtension.IsValid())
@@ -758,13 +881,35 @@ void AFogOfWar::UploadSceneGpuVisionSources(bool bSceneFogActive)
 	Settings.Opacity = FMath::Clamp(SceneFogOpacity, 0.0f, 1.0f);
 	Settings.PlaneZ = SceneFogWorldPlaneZ;
 
+	// 视野场几何算**一次**、用两处：① 决定持久 RT 要不要重建（打包趟的输出尺寸就来自它）；
+	// ② 判定"本帧的场是否真的可用"（bEnabled 的门之一）。
+	const FFogOfWarSceneVisionField Field = ComputeSceneFogVisionField(FieldWorldMin, FieldWorldSize, VisionFieldTexelSizeCm);
+
+	EnsureVisionFieldTexture(Field.TexelCount);
+
+	// 把"本帧迷雾是否生效"发布给其余系统（消费方据此决定敌方单位/特效该不该遮蔽）。
+	//
+	// bEnabled 只在"本帧真的要画雾"时置位：观察者/管理员、或总开关关闭时画面本来就没有雾，
+	// 此时若还让消费方按旧的可见性去遮敌人，就会出现"画面上没有雾、敌人却凭空消失"。
+	{
+		FMassBattleFogVisionField Snapshot;
+		Snapshot.bEnabled = bSceneFogActive && VisionFieldTexture != nullptr && Field.IsValid();
+		FMassBattleFogVisionFieldProvider::Set(Snapshot);
+
+		// 本帧的视野源集（内部构建索引，每帧一次）：消费方（Agent/FX 渲染处理器）据此逐帧判
+		// "敌方单位/特效该不该画"。它与上面的 bEnabled 是一对 —— 只有真的在画雾时才发布，
+		// 否则消费方会因为"没有源"而把所有敌人藏起来（画面上却没有雾）。
+		FMassBattleFogVisionFieldProvider::SetVisionSources(CpuVisionSourceCircles, CpuVisionSourceDirs);
+	}
+
 	// 清单本身会被交换走，换回来的是上一帧用过的缓冲（见调用方开头的 Reset）。
 	SceneFogViewExtension->UploadFrameData_GameThread(
 		SceneGpuVisionSources,
 		SceneGpuVisionSourceDirs,
 		Settings,
-		ComputeSceneFogVisionField(FieldWorldMin, FieldWorldSize, VisionFieldTexelSizeCm),
-		bSceneFogActive);
+		Field,
+		bSceneFogActive,
+		VisionFieldTexture);
 }
 
 int32 AFogOfWar::CollectVisionSourcesByTeam(TArray<TArray<FFogVisionSource>>& OutSourcesByTeam, int32 InTeamCount, int32* OutHighestTeamIndexSeen) const

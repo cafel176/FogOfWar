@@ -7,6 +7,7 @@
 #include "SceneViewExtension.h"
 
 class FRDGBuilder;
+class UTextureRenderTarget2D;
 struct FScreenPassTexture;
 struct FPostProcessMaterialInputs;
 
@@ -148,7 +149,8 @@ public:
 		TArray<FVector4f>& InOutSourceDirs,
 		const FFogOfWarSceneFogSettings& InSettings,
 		const FFogOfWarSceneVisionField& InField,
-		bool bInSceneFogActive);
+		bool bInSceneFogActive,
+		UTextureRenderTarget2D* InFieldTexture);
 
 	/**
 	 * @brief 游戏线程：交出历史已探索层（只在内容真的变化时调用）。
@@ -185,6 +187,32 @@ private:
 	/** 本帧是否应该用雾遮蔽画面（与"有没有视野源"是两件事，见 UploadFrameData_GameThread）。
 	 *  false = 雾系统关闭 / 子系统不可用 → 渲染侧完全不注入 pass，画面不受遮蔽。 */
 	bool PendingSceneFogActive = true;
+
+	/**
+	 * 本帧将要被写入的**持久**视野场纹理（由 AFogOfWar 持有）。
+	 *
+	 * 打包趟会把 R8G8 场**直接**渲染进它（RDG 用 RegisterExternalTexture 挂上去，不是拷贝），
+	 * 因此屏幕上的雾与"迷雾遮蔽敌人"用的是同一份像素数据 —— 遮蔽边界与雾边界逐像素重合，
+	 * 这也是选这条路线的全部理由。
+	 *
+	 * 弱引用：纹理归 Actor 所有，渲染线程只用它当帧的一瞬间，不参与 GC 生命周期。
+	 * 为空（未激活 / Actor 已销毁）时退回本帧的瞬态场，雾气本身不受影响，只是没有对外发布。
+	 */
+	TWeakObjectPtr<UTextureRenderTarget2D> PendingFieldTexture;
+
+	/** 渲染线程手里的持久视野场纹理快照。 */
+	TWeakObjectPtr<UTextureRenderTarget2D> RenderThreadFieldTexture;
+
+	/**
+	 * "本帧已经发布过视野场了吗"的判据（渲染线程私有）。
+	 *
+	 * 为什么需要：多视口 / 多 ViewFamily 都会走进 PostProcess_RenderThread，而它们共用同一张外部纹理 ——
+	 * 同一帧写两次就是同一张 RDG 纹理上的无序写，属于未定义行为（RDG 会在调试模式下报错）。
+	 * 用 (ViewFamily, FrameNumber) 而不是帧计数器：同一个 Family 内所有视口的 FrameNumber 完全相同，
+	 * 因此多视口必然只发布一次；不同 Family 各自有自己的 RDG 图，各自发布一次是安全的。
+	 */
+	const FSceneViewFamily* LastFieldPublishFamily = nullptr;
+	uint64 LastFieldPublishFrameNumber = 0;
 
 	/**
 	 * @brief 渲染线程私有的本帧快照。
